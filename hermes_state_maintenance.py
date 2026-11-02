@@ -534,11 +534,14 @@ class SessionMaintenanceMixin:
                 respect_gateway_heartbeats=False,  # state-owned lifecycles, not gateway heartbeats
             )
             result["closed"] = len(closed)
-            # VACUUM only if rows were freed, the time throttle passed AND the
-            # freelist ratio passed — it holds an exclusive lock for a full rewrite.
+            # VACUUM only if the time throttle passed AND the freelist ratio passed —
+            # it holds an exclusive lock for a full rewrite.
             since_vacuum = _seconds_since(now, self.get_meta("last_vacuum"))
             vacuum_due = since_vacuum is None or since_vacuum >= min_vacuum_interval_days * 86400
-            if vacuum and pruned > 0 and vacuum_due:
+            ratio = None
+            if vacuum and vacuum_due:
+                # Sample AFTER the stale-open sweep above so the handles it closed are
+                # reflected in the ratio used for the VACUUM decision.
                 result["freelist_ratio"] = ratio = self._freelist_ratio()
                 # Same admission `hermes sessions optimize` runs: VACUUM plus the TRUNCATE checkpoint
                 # retire the WAL generation a sibling writer (gateway, Desktop, dashboard, cron) still
@@ -557,7 +560,10 @@ class SessionMaintenanceMixin:
                         "state.db auto-maintenance: skipping VACUUM, %d other process(es) hold the "
                         "store or a WAL sidecar (%s)",
                         len(holders), ", ".join(f"{pid}:{target}" for pid, target in holders[:3]))
-                elif ratio is None or ratio > min_vacuum_freelist_ratio:
+                # None ratio = PRAGMA read failed / DB state unknown. Unknown reclaimability
+                # must SKIP the VACUUM: a full rewrite on an unmeasured store is blind, so fall
+                # through to the skip branch instead of treating None as "reclaimable enough".
+                elif ratio is not None and ratio > min_vacuum_freelist_ratio:
                     try:
                         # VACUUM rewrites every page with ~zero CPU: renew the lease here so
                         # a multi-minute rewrite on a large state.db never outlives the clamp.
@@ -568,9 +574,14 @@ class SessionMaintenanceMixin:
                     except Exception as exc:
                         logger.warning("state.db VACUUM failed: %s", exc)
                 else:
-                    logger.debug("state.db auto-maintenance: skipping VACUUM, only "
-                                 "%.1f%% of pages reclaimable (threshold %.0f%%)",
-                                 ratio * 100.0, min_vacuum_freelist_ratio * 100.0)
+                    if ratio is None:
+                        logger.debug("state.db auto-maintenance: skipping VACUUM, freelist "
+                                     "ratio unknown (PRAGMA read failed) — unknown "
+                                     "reclaimability does not justify a full rewrite")
+                    else:
+                        logger.debug("state.db auto-maintenance: skipping VACUUM, only "
+                                     "%.1f%% of pages reclaimable (threshold %.0f%%)",
+                                     ratio * 100.0, min_vacuum_freelist_ratio * 100.0)
             # Record even when pruned == 0 so the throttle holds.
             self.set_meta("last_auto_prune", str(now))
             if closed or pruned > 0:
