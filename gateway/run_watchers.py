@@ -49,30 +49,39 @@ class GatewaySessionWatchersMixin:
 
     async def _session_housekeeping(self) -> None:
         """Idle/pressure agent-cache sweeps plus the hourly SessionStore prune."""
+        evicted_idle = 0
         try:
-            if evicted := self._sweep_idle_cached_agents():
-                logger.info("Agent cache idle sweep: evicted %d agent(s)", evicted)
+            if evicted_idle := self._sweep_idle_cached_agents():
+                logger.info("Agent cache idle sweep: evicted %d agent(s)", evicted_idle)
         except Exception as e:
             logger.debug("Idle agent sweep failed: %s", e)
         # Neither LRU cap nor idle TTL knows what a cached transcript costs in memory.
+        evicted_pressure = 0
         try:
             # Neither the LRU cap nor the idle TTL is aware of how much memory a cached transcript costs, so
             # a busy gateway keeps every warm session's tool output resident until RSS hits the cgroup limit
             # (#80764). Shed LRU transcripts once the heap is over budget; they reload from the persisted
             # session on the next turn.
-            self._sweep_agent_cache_under_pressure()
+            evicted_pressure = self._sweep_agent_cache_under_pressure()
         except Exception as e:
             logger.debug("Agent cache pressure sweep failed: %s", e)
         # Prune stale SessionStore entries: the dict + sessions.json otherwise grow unbounded.
+        pruned = 0
         prune_ts = getattr(self, "_last_session_store_prune_ts", 0.0)  # tests may omit
         if time.time() - prune_ts > _SESSION_STORE_PRUNE_INTERVAL:
             try:
                 max_age = int(getattr(self.config, "session_store_max_age_days", 0) or 0)
-                if max_age > 0 and (n := await self.async_session_store.prune_old_entries(max_age)):
-                    logger.info("SessionStore prune: dropped %d stale entries", n)
+                if max_age > 0:
+                    n = await self.async_session_store.prune_old_entries(max_age)
+                    pruned = n
+                    if n:
+                        logger.info("SessionStore prune: dropped %d stale entries", n)
             except Exception as e:
                 logger.debug("SessionStore prune failed: %s", e)
             self._last_session_store_prune_ts = time.time()
+        # One structured record per pass so regressions are greppable (event name + numeric fields).
+        logger.info("watcher.housekeeping.pass evicted_idle=%d evicted_pressure=%d pruned=%d",
+                    evicted_idle, evicted_pressure, pruned)
 
     def _session_stall_timeout_seconds(self) -> float:
         """Return configured stall timeout (seconds); 0 disables the watchdog."""
@@ -118,6 +127,7 @@ class GatewaySessionWatchersMixin:
         if getattr(self, "_session_stall_notified", None) is None:  # tests may build bare runners
             self._session_stall_notified = {}
         notified_map = self._session_stall_notified
+        before_latches = set(notified_map)
         sent, now, candidates = 0, time.time(), self._stall_candidates()
         # Every candidate carries a non-None pending event, so has_pending_inbound is always True.
         for session_key, (adapter, pending_event) in list(candidates.items()):
@@ -140,6 +150,13 @@ class GatewaySessionWatchersMixin:
         # Drop latches for sessions that no longer appear in any pending map.
         for key in [k for k in notified_map if k not in candidates]:
             notified_map.pop(key, None)
+        after_latches = set(notified_map)
+        # One structured record per pass so regressions are greppable (event name + numeric fields).
+        # latches_set/cleared are key-set diffs: a key cleared and re-set within one pass nets to zero
+        # in both (sub-tick race; informational only, never affects behavior).
+        logger.info("watcher.stall.pass candidates=%d latches_set=%d latches_cleared=%d notified=%d",
+                    len(candidates), len(after_latches - before_latches),
+                    len(before_latches - after_latches), sent)
         return sent
 
     async def _notify_session_stall(self, session_key: str, adapter, pending_event,
@@ -217,10 +234,16 @@ class GatewaySessionWatchersMixin:
         from hermes_cli.model_catalog import refresh_catalogs, refresh_interval_seconds
         await asyncio.sleep(30)  # let startup settle
         while self._running:
+            start = time.perf_counter()
+            ok = 0
             try:
                 await asyncio.to_thread(refresh_catalogs)
+                ok = 1
             except Exception as exc:
                 logger.debug("Model catalog refresh failed: %s", exc)
+            # One structured record per pass so regressions are greppable (event name + numeric fields).
+            logger.info("watcher.catalog.refresh duration_ms=%.3f ok=%d",
+                        (time.perf_counter() - start) * 1000.0, ok)
             try:
                 interval = refresh_interval_seconds()
             except Exception:
