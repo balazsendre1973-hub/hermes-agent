@@ -1,10 +1,9 @@
 """Provider reasoning-parameter policy for ``AIAgent``.
 
-When ``reasoning`` extra_body is safe to send, LM Studio / Ollama / endpoint-profile capability probes,
+When ``reasoning`` extra_body is safe to send, LM Studio / Ollama / GitHub Models capability probes,
 ``reasoning_content`` echo families, and strict-API tool-call sanitising.
 Extracted from ``run_agent.py``; every method resolves through ``AIAgent``'s MRO unchanged.
 """
-import logging
 import time
 
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static
@@ -16,9 +15,6 @@ _OPENROUTER_REASONING_PREFIXES = (
     "deepseek/", "anthropic/", "openai/", "x-ai/", "google/gemini-2", "google/gemma-4",
     "qwen/qwen3", "tencent/hy", "xiaomi/",
 )
-
-# Hosts whose reasoning gate core owns: a plugin claiming one in ``hostnames`` never replaces it.
-_CORE_REASONING_GATED_HOSTS = ("nousresearch.com", "ai-gateway.vercel.sh", "ollama.com")
 
 # Probe results cache per (model, base_url). Definitive values cache permanently; an
 # "unknown" value (empty list / None) caches 60s so a transient failure neither sticks
@@ -95,11 +91,13 @@ class ReasoningParamsMixin:
         url = self._base_url_lower
         if base_url_host_matches(url, "nousresearch.com") or base_url_host_matches(url, "ai-gateway.vercel.sh"):
             return True
-        if (profile := self._reasoning_endpoint_profile()) is not None:
-            # A claimed endpoint gates on its own catalog: reasoning goes out iff it declares a payload.
-            from agent.provider_route_hooks import ask_profile
-            return ask_profile(profile, "reasoning_payload", None, self.model, None,
-                               base_url=self.base_url, scope=self) is not None
+        if base_url_host_matches(url, "models.github.ai") or base_url_host_matches(url, "githubcopilot.com"):
+            try:
+                from hermes_cli.models import github_model_reasoning_efforts
+
+                return bool(github_model_reasoning_efforts(self.model))
+            except Exception:
+                return False
         if (self.provider or "").strip().lower() == "lmstudio":
             # "off-only" (or absent) means no real reasoning capability.
             return any(opt and opt != "off" for opt in self._lmstudio_reasoning_options_cached())
@@ -138,62 +136,36 @@ class ReasoningParamsMixin:
             return False
         return bool(_cached_probe(self, "_ollama_thinking_cache", ollama_model_supports_thinking, None, lambda v: v is not None))
 
-    def _reasoning_endpoint_profile(self):
-        """The profile claiming this endpoint (``providers.profile_for_host``) that gates its reasoning, or None.
-        Endpoints core gates itself (Nous Portal, Vercel AI Gateway, LM Studio, Ollama Cloud, OpenRouter) keep
-        core's gate even when a plugin claims their host for metadata or auxiliary routing."""
-        url = self._base_url_lower
-        if ((self.provider or "").strip().lower() == "lmstudio" or self._is_openrouter_url()
-                or any(base_url_host_matches(url, host) for host in _CORE_REASONING_GATED_HOSTS)):
-            return None
+    def _github_models_reasoning_extra_body(self) -> dict | None:
+        """Format reasoning payload for GitHub Models/OpenAI-compatible routes."""
         try:
-            from providers import profile_for_host
-        except ImportError:
-            # Fail-open: the live tree sits on a branch older than origin/main,
-            # which is where providers.profile_for_host lives (origin/main:329).
-            # Without it, no profile claims the endpoint -> core default gating.
+            from hermes_cli.models import clamp_github_reasoning_effort, github_model_reasoning_efforts
+        except Exception:
             return None
 
-        return profile_for_host(str(getattr(self, "base_url", None) or ""))
-
-    def _endpoint_reasoning_payload(self) -> dict | None:
-        """``reasoning_payload`` of the profile gating this endpoint's reasoning for the agent's model and
-        ``reasoning_config`` (``_reasoning_endpoint_profile``), or None when no profile does."""
-        base_url = getattr(self, "base_url", None)
-        profile = self._reasoning_endpoint_profile()
-        if profile is None:
+        supported = github_model_reasoning_efforts(self.model)
+        if not supported:
             return None
-        from agent.provider_route_hooks import ask_profile
-        return ask_profile(profile, "reasoning_payload", None, self.model, self.reasoning_config,
-                           base_url=str(base_url), scope=self)
 
-    def _build_assistant_message(self, assistant_message, finish_reason: str) -> dict:
-        """``build_assistant_message``; a held turn's row with visible text comes back typed hidden
-        (``withhold_held_row``) until ``finish_text_response`` publishes it as the final."""
-        from agent.chat_completion_helpers import build_assistant_message
-        from agent.stream_delivery import withhold_held_row
+        cfg = self.reasoning_config if isinstance(self.reasoning_config, dict) else {}
+        if cfg.get("enabled") is False:
+            return None
+        return {"effort": clamp_github_reasoning_effort(cfg.get("effort"), supported)}
 
-        return withhold_held_row(self, build_assistant_message(self, assistant_message, finish_reason))
+    _build_assistant_message = _forward("agent.chat_completion_helpers", "build_assistant_message")
 
     def _reasoning_replay_route(self):
         """Reasoning replay decision for the active route (``message_sanitization.reasoning_replay_route``).
 
-        Cached per (api_mode, provider, model, base_url, opt-in, rejected keys, resolved model
-        opt-outs) — called many times per turn — and recomputed after ``switch_model()`` / fallback
-        activation or a recorded field rejection, the only events allowed to change the replayed
-        bytes mid-session. The model-scoped replay opt-outs (``model.reasoning_replay_off`` /
-        ``model.reasoning_replay_filter``) are resolved fresh into the key, so a config edit reaches
-        the wire without a restart and the estimator predicate (``stale_thinking_reaches_wire``,
-        which reads the same config) can never disagree with it.
+        Cached per (api_mode, provider, model, base_url, opt-in, rejected keys) — called many times
+        per turn — and recomputed after ``switch_model()`` / fallback activation or a recorded
+        field rejection, the only events allowed to change the replayed bytes mid-session.
         """
-        from agent.message_sanitization import (
-            model_replay_filter, model_replay_opt_out, reasoning_replay_route, rejected_reasoning_carriers,
-        )
+        from agent.message_sanitization import reasoning_replay_route, rejected_reasoning_carriers
 
         rejected = rejected_reasoning_carriers(self)
-        opt_out, replay_filter = model_replay_opt_out(self.model), model_replay_filter(self.model)
         key = (getattr(self, "api_mode", None), self.provider, self.model, getattr(self, "_base_url_lower", self.base_url),
-               self._reasoning_echo_opt_in(), rejected, opt_out, replay_filter)
+               self._reasoning_echo_opt_in(), rejected)
         cached = getattr(self, "_reasoning_route_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
@@ -220,15 +192,7 @@ class ReasoningParamsMixin:
         try:
             from hermes_cli.config import load_config_readonly
             return bool((load_config_readonly().get("model") or {}).get("reasoning_echo"))
-        except Exception as exc:  # health: allow BLE001 -- a config failure must fall back, not fail init
-            # Log the class, never the config value or exception traceback.
-            logging.getLogger("run_agent").warning(
-                "Agent configuration for model.reasoning_echo could not be loaded (%s); "
-                "using the default reasoning echo setting. Check the active Hermes Python "
-                "environment and dependencies; run 'hermes config check' after "
-                "configuration imports work again.",
-                type(exc).__name__,
-            )
+        except Exception:
             return False
 
     # Echo families are host/provider-driven, not model-name-driven: aggregators re-exporting Kimi reject the
