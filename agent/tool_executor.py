@@ -173,15 +173,27 @@ class _BatchAbandoned(BaseException):
 
 
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
-    """Parse model-emitted arguments without repairing or coercing them."""
-    try:
-        arguments = json.loads(raw_arguments)
-    except (json.JSONDecodeError, TypeError):
-        arguments = None
-    if isinstance(arguments, dict):
+    """Parse model-emitted arguments into a dict.
+
+    Every tool argument passes through the central coercion helper
+    (agent.tool_arg_coercion.coerce_tool_arguments): ``dict`` passes through
+    unchanged, ``str`` is JSON-parsed (a JSON object becomes the dict, anything
+    else becomes ``{}``). When a string arrives instead of a dict, a teaching
+    message is returned on the model-visible channel so the model learns the
+    JSON-object contract; malformed input keeps the existing structured error
+    result and the tool is not executed.
+    """
+    from agent.tool_arg_coercion import coerce_tool_arguments
+
+    arguments, teaching = coerce_tool_arguments(raw_arguments)
+    if teaching is None:
         return arguments, None
     return {}, json.dumps(
-        {"error": "Invalid tool arguments", "message": "Tool arguments must be a valid JSON object; tool was not executed."},
+        {
+            "error": "Invalid tool arguments",
+            "message": "Tool arguments must be a valid JSON object; tool was not executed.",
+            "teaching": teaching,
+        },
         ensure_ascii=False,
     )
 
@@ -360,34 +372,23 @@ def _append_skipped_tool_results(
 def _tool_search_scoped_names(agent) -> frozenset:
     """Deferrable tool names the session may invoke via ``tool_call``; the unwrap bypasses
     the bridge's scope check in ``model_tools.handle_function_call``, so restricted sessions
-    validate against this set. Cached on the agent, keyed by registry scope/generation."""
+    validate against this set. Read through the ``get_tool_definitions`` memo on every call
+    and never copied onto the agent: the memo expires with the check_fn verdicts it was
+    filtered on, a per-agent copy keyed on registry generation would not, and a recovered
+    MCP server's tools would stay uncallable for the agent's lifetime."""
     try:
         import model_tools
         from tools import tool_search as _ts
-        from tools.registry import registry as _registry
     except Exception:
         return frozenset()
-
-    enabled = getattr(agent, "enabled_toolsets", None)
-    disabled = getattr(agent, "disabled_toolsets", None)
-    cache_key = (
-        _registry.current_scope_key(),
-        getattr(_registry, "_generation", 0),
-        frozenset(enabled) if enabled is not None else None,
-        frozenset(disabled) if disabled is not None else None,
-    )
-    cached = getattr(agent, "_tool_search_scope_cache", None)
-    if cached is not None and cached[0] == cache_key:
-        return cached[1]
     try:
-        names = _ts.scoped_deferrable_names(model_tools.get_tool_definitions(
-            enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=True, skip_tool_search_assembly=True,
+        return _ts.scoped_deferrable_names(model_tools.get_tool_definitions(
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            quiet_mode=True, skip_tool_search_assembly=True,
         ) or [])
     except Exception:
-        names = frozenset()
-    with contextlib.suppress(Exception):
-        agent._tool_search_scope_cache = (cache_key, names)
-    return names
+        return frozenset()
 
 
 def _canonical_tool_name(function_name: str) -> str:

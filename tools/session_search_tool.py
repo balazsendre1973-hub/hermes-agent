@@ -11,8 +11,10 @@ No LLM calls — every shape returns actual DB messages.
 import json
 import logging
 import re
+import sys
 import time
 from datetime import datetime, timezone, UTC
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from hermes_state_common import _BOUNDARY_END_REASONS
@@ -421,8 +423,24 @@ def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort
         entry = _hydrate_hit(db, lineage_root, match_info, "full" if detail == "full" or not results else "compact")
         if entry is not None:
             results.append(entry)
+    # memoria-v2 hybrid leg alongside the session FTS5 results (RRF fusion).
+    # Lazy, guarded import: degrades to session-only when the memoria stack
+    # (fastembed + sqlite_vec) is not importable in this interpreter.
+    try:
+        _bridge_dir = str(Path(__file__).resolve().parent)
+        if _bridge_dir not in sys.path:
+            sys.path.insert(0, _bridge_dir)
+        from memoria_bridge import memoria_merge  # noqa: import-outside-toplevel
+    except Exception:
+        memoria_merge = None
+    if memoria_merge is not None:
+        results = memoria_merge(results, query, limit)
+
     for entry in results:
-        entry["link"] = _session_link(entry["session_id"], link_profile)
+        if entry.get("_memoria"):
+            entry["link"] = ""
+        else:
+            entry["link"] = _session_link(entry["session_id"], link_profile)
     return _discover_payload(db, query, detail, results, sessions_searched=len(seen_sessions), link_hint=(
         "When referring the user to a session, write its `link` value "
         "verbatim inline mid-sentence (it renders as a titled link) — never "
@@ -582,8 +600,10 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
         if around_message_id is not None:
             return _scroll(db, session_id.strip(), around_message_id, window, current_session_id)
         return _read_scoped(db, session_id.strip(), profile)
-    limit = _clamp_int(limit, 3, 1, 10)
-    if not query or not isinstance(query, str) or not query.strip():
+    browse = not query or not isinstance(query, str) or not query.strip()
+    # Browse lists enough recent sessions to pick from; discovery returns a few ranked hits.
+    limit = _clamp_int(limit, 10 if browse else 3, 1, 10)
+    if browse:
         return _list_recent_sessions(db, limit, current_session_id, link_profile=profile)
     sort_norm = sort.strip().lower() if isinstance(sort, str) else None
     try:
@@ -598,7 +618,7 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
         exclude_session_ids=_normalize_exclude_session_ids(exclude_session_ids))
 
 
-def session_search(query: str = "", role_filter: str | None = None, limit: int = 3, db=None,
+def session_search(query: str = "", role_filter: str | None = None, limit: int | None = None, db=None,
                    current_session_id: str | None = None, session_id: str | None = None, around_message_id: int | None = None,
                    window: int = 5, sort: str | None = None, profile: str | None = None, detail: str = "adaptive",
                    after: str | None = None, before: str | None = None, exclude_session_ids: Optional[list[str]] = None) -> str:
@@ -690,11 +710,11 @@ SESSION_SEARCH_SCHEMA = {
             "limit": {
                 "type": "integer",
                 "description": (
-                    "Discovery shape only. Max sessions to return (default 3, max 10). "
-                    "Bump to 5–10 when the topic likely spans several sessions and you "
-                    "want to pick the right one to scroll into."
+                    "Max sessions to return. Discovery defaults to 3; browse/no-args "
+                    "defaults to 10. Max 10. Bump discovery to 5–10 when the topic "
+                    "likely spans several sessions and you want to pick the right one "
+                    "to scroll into."
                 ),
-                "default": 3,
             },
             "sort": {
                 "type": "string",
@@ -798,7 +818,7 @@ registry.register(
     toolset="session_search",
     schema=SESSION_SEARCH_SCHEMA,
     handler=lambda args, **kw: session_search(
-        query=args.get("query") or "", limit=args.get("limit", 3), window=args.get("window", 5),
+        query=args.get("query") or "", limit=args.get("limit"), window=args.get("window", 5),
         detail=args.get("detail", "adaptive"), db=kw.get("db"), current_session_id=kw.get("current_session_id"),
         **{k: args.get(k) for k in ("role_filter", "session_id", "around_message_id", "sort", "profile",
                                     "after", "before", "exclude_session_ids")}),
