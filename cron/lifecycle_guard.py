@@ -71,8 +71,9 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
 # `taskkill /F /IM python.exe`, `pkill -9 python3` or `killall python` carry no hermes/gateway token
 # yet terminate it (#113667). Token-aware rather than a line regex: option VALUES are never read as
 # targets (`pkill -u <user> chrome`), `-f` cmdline patterns are judged as patterns, and other image
-# names (`taskkill /F /IM chrome.exe`) stay available. Numeric-PID kills are out of scope:
-# the explicit PID / `proc_*` id IS the ownership-scoped route the rejection points to.
+# names (`taskkill /F /IM chrome.exe`) stay available. Numeric-PID kills against the live gateway
+# PID are covered by Branch F (`_kill_us1_targets_gateway`): the launch-home identity files / host
+# rendezvous record prove the target even though the command carries no hermes/gateway token.
 _INTERPRETER_IMAGE_RE = re.compile(r"^pythonw?(?:\d+(?:\.\d+)*)?(?:\.exe)?$")
 _HOST_INTERPRETER_NAME = Path(sys.executable).name.lower() if sys.executable else ""
 _KILLER_VALUE_OPTIONS = {
@@ -101,11 +102,125 @@ _GATEWAY_CMDLINE_TOKEN_RE = re.compile(r"(?i)hermes_cli|\bhermes\b[^\n]*\bgatewa
 # Rejection text for Branch E, shared by every tool surface that runs the guard so the agent is
 # pointed at the ownership-scoped route (proc_* id / explicit PID) rather than the shell.
 HOST_INTERPRETER_KILL_REJECTION = (
-    "Blocked: this command kills every process whose image/name matches the Python "
-    "interpreter, which is the process hosting this gateway (and this command). "
+    "Blocked: this command kills every process whose image/name matches the Python interpreter, "
+    "which is the process hosting this gateway (and this command). "
     "Stop only the process you own instead: process(action=\"kill\", session_id=\"proc_…\") "
     "for a background job Hermes started, or kill/taskkill by its explicit PID."
 )
+
+# SIGUSR1 spellings understood by procps kill: -USR1, -s USR1, --signal USR1, -10 (signal 10).
+_USR1_SIGNAL_SPELLINGS = frozenset({"usr1", "sigusr1", "10"})
+
+# Rejection text for Branch F, shared by every tool surface that runs the guard. SIGUSR1 starts
+# the gateway drain, which waits for in-flight turns (1800 s), while every worker inside the
+# gateway dies immediately (exit 130): the text names that so the model does not re-roll the same
+# kill spelling. The only way out is outside the gateway (`hermes gateway restart` from a
+# separate shell); stopping one's own job is the ownership-scoped route.
+USR1_GATEWAY_KILL_REJECTION = (
+    "Blocked: `kill -USR1 <gateway-pid>` targets the live gateway PID. SIGUSR1 starts the "
+    "gateway drain, which waits for in-flight turns (1800 s), while every worker inside the "
+    "gateway dies immediately (exit 130): all running workers are interrupted. Stop only your "
+    "own process instead: process(action=\"kill\", session_id=\"proc_…\") for a Hermes "
+    "background job, or kill that job's own explicit PID. Run `hermes gateway restart` from a "
+    "separate shell outside the running gateway."
+)
+
+
+def _kill_signal_and_pids(args: list[str]) -> tuple[Optional[str], list[int]]:
+    """Parse a ``kill`` argument list: the signal spelling and the positive numeric PIDs it
+    targets. ``kill -l/--list`` sends nothing and yields ``(None, [])``. Unknown option tokens
+    are skipped; a leading dash followed by digits is a numeric signal, otherwise a signal name
+    (``-USR1``). Process-group targets (``-- -477345``) are deliberately not read as PIDs."""
+    signal: Optional[str] = None
+    pids: list[int] = []
+    position = 0
+    while position < len(args):
+        token = args[position]
+        low = token.lower()
+        if low in ("-l", "--list"):
+            return None, []
+        if low in ("-s", "--signal"):
+            if position + 1 < len(args):
+                signal = args[position + 1].lower()
+                position += 2
+            else:
+                position += 1
+            continue
+        if low.startswith("-s") and len(low) > 2:
+            signal = token[2:].lower()
+            position += 1
+            continue
+        if low.startswith("--signal="):
+            signal = token.split("=", 1)[1].lower()
+            position += 1
+            continue
+        if low.startswith("-") and low != "-":
+            rest = low[1:]
+            if rest.isdigit():
+                signal = rest             # -10 (signal 10 == SIGUSR1 on Linux)
+            elif signal is None and rest.isascii() and rest.isalnum():
+                signal = rest             # -USR1
+            position += 1
+            continue
+        if token.isdigit():
+            pids.append(int(token))
+        position += 1
+    return signal, pids
+
+
+def _kill_us1_targets_gateway(text: str) -> bool:
+    """True when *text* executes ``kill -USR1 <pid>`` (any signal spelling) against the live host
+    gateway PID. Numeric-PID kills carry no hermes/gateway token, so Branches B/D cannot see
+    them: the gateway PID itself proves the target, resolved from the launch-home identity files
+    / host rendezvous record (never the worker's HERMES_HOME profile home). Fail open when the
+    live gateway PID cannot be resolved."""
+    gateway_pid = _live_host_gateway_pid()
+    if gateway_pid is None:
+        return False
+    try:
+        segments = list(_iter_command_segments(text))
+    except ValueError:
+        return False
+    for segment in segments:
+        # shlex keeps a quoted string as ONE token (`bash -c 'kill -USR1 477345'` ->
+        # ["bash", "-c", "kill -USR1 477345"]), so split on whitespace to find a kill
+        # that hides inside a quoted command string. Matches the guard's existing
+        # fail-closed reading of quoted text (raw regex already blocks `echo 'hermes gateway restart'`).
+        flat = [subtoken for token in segment for subtoken in token.split()]
+        index = _executed_command_index(flat)
+        if index is None:
+            continue
+        name = _executable_name(flat[index]).removesuffix(".exe").lower()
+        if name != "kill":
+            # A wrapper may pass ``kill`` down as an operand (e.g. ``xargs kill ...``): check any
+            # token whose executable name is kill, with its following tokens as arguments.
+            for candidate in range(len(flat)):
+                if (
+                    _executable_name(flat[candidate]).removesuffix(".exe").lower() == "kill"
+                    and candidate + 1 < len(flat)
+                ):
+                    signal, pids = _kill_signal_and_pids(flat[candidate + 1 :])
+                    if signal in _USR1_SIGNAL_SPELLINGS and gateway_pid in pids:
+                        return True
+            continue
+        signal, pids = _kill_signal_and_pids(flat[index + 1 :])
+        if signal in _USR1_SIGNAL_SPELLINGS and gateway_pid in pids:
+            return True
+    return False
+
+
+def _live_host_gateway_pid() -> Optional[int]:
+    """Live host gateway PID, independent of this process's HERMES_HOME.
+
+    Delegates to :func:`gateway.status.get_host_gateway_pid`: the host rendezvous record names
+    the gateway regardless of which profile's turn is active, so a worker whose HERMES_HOME is
+    its profile home still resolves the gateway's own ``gateway.pid`` (launch home)."""
+    try:
+        from gateway.status import get_host_gateway_pid
+
+        return get_host_gateway_pid()
+    except Exception:
+        return None
 
 
 def _is_interpreter_image(value: str, *, substring: bool = False) -> bool:
@@ -454,6 +569,10 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     # "gui/$uid/$label"`), so neither the same-span regex nor same-segment tokenization sees verb and label
     # together. Check "verb anywhere AND label anywhere" instead.
     # Branch E (#113667): killers aimed at the interpreter image itself carry no hermes/gateway token.
+    # Branch F: `kill -USR1 <pid>` where pid is the live gateway PID — a numeric-PID kill needs no
+    # hermes/gateway token because the gateway PID itself proves the target.
+    if _kill_us1_targets_gateway(normalized):
+        return True
     return _contains_launchctl_gateway_lifecycle(normalized) or contains_host_interpreter_kill(normalized)
 
 

@@ -274,18 +274,20 @@ def gateway_lifecycle_block(
     a self-restart into a respawn loop, so it passes too.
     Returns the JSON error string when blocked, else None.
     """
-    from tools.process_registry import _is_supervised_gateway_process
+    from tools.process_registry import _is_gateway_context_process
     from tools.terminal_tool import _resolve_command_cwd, get_session_cwd
 
-    if not _is_supervised_gateway_process():
+    if not _is_gateway_context_process():
         return None
     from cron.lifecycle_guard import (
         _MAX_REFERENCED_SCRIPT_BYTES,
         HOST_INTERPRETER_KILL_REJECTION,
+        USR1_GATEWAY_KILL_REJECTION,
         contains_host_interpreter_kill,
         contains_launchctl_submit_command,
         lifecycle_scan_root_within_budget,
         scan_gateway_lifecycle,
+        _kill_us1_targets_gateway,
     )
     # Keep the specific launchctl diagnostic when this optional pre-scan fits the
     # budget. The full fail-closed guard below still runs when it does not, so
@@ -325,6 +327,11 @@ def gateway_lifecycle_block(
             "error",
         )
     if unsafe:
+        # Numeric-PID SIGUSR1 against the live gateway PID: SIGUSR1 starts the gateway drain
+        # (waits for in-flight turns, 1800 s) while every worker inside the gateway dies
+        # immediately — name that effect instead of the generic TERM-style block text.
+        if lifecycle_scan_root_within_budget(command) and _kill_us1_targets_gateway(command):
+            return _blocked_json(USR1_GATEWAY_KILL_REJECTION, "error")
         # Name the ownership-scoped route for image-name kills: the intent is almost always "stop
         # MY background job", and re-rolling the same over-broad spelling is what takes the gateway down.
         if lifecycle_scan_root_within_budget(command) and contains_host_interpreter_kill(command):

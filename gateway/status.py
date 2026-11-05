@@ -2103,3 +2103,28 @@ def get_running_pid_cached(
     with _gateway_running_pid_cache_lock:
         _gateway_running_pid_cache[key] = (time.monotonic(), refreshed_signature, pid)
     return pid
+
+
+def get_host_gateway_pid() -> Optional[int]:
+    """PID of the one live gateway on this host, independent of the caller's HERMES_HOME.
+
+    A worker's HERMES_HOME is its profile home, which has no ``gateway.pid`` —
+    :func:`get_running_pid` would overlook the gateway there. The host rendezvous record
+    (:func:`gateway.host_topology.host_gateway_topology`) names the one live gateway process
+    on this host and is proven against PID reuse (``record_names_live_owner``), so it answers
+    from any process on the host. Inside the gateway process itself this process's home IS the
+    launch home, so its pid file is the fallback. Returns None when no gateway owns the host
+    role or it cannot be proven live.
+    """
+    try:
+        from gateway.host_topology import host_gateway_topology
+
+        topology = host_gateway_topology()
+        if topology is not None and topology.pid:
+            return int(topology.pid)
+    except Exception:  # topology unavailable: fall through to the process-home pid file
+        logger.debug("host gateway topology unavailable for pid resolution", exc_info=True)
+    try:
+        return get_running_pid(cleanup_stale=False)
+    except Exception:
+        return None
