@@ -328,6 +328,32 @@ def _is_supervised_gateway_process() -> bool:
         return False
 
 
+def _is_gateway_context_process() -> bool:
+    """Whether this process runs inside the live supervised gateway — the gateway itself or a
+    worker/cron child spawned under it.
+
+    ``_is_supervised_gateway_process()`` requires owning the live gateway PID
+    (``os.getpid() == gateway_pid``), which excludes workers: they are separate processes in the
+    gateway's cgroup. A worker's markers (``_HERMES_GATEWAY``, ``HERMES_SUPERVISED_CHILD``) are
+    inherited, and its ``HERMES_HOME`` points at its profile home — never the launch home that
+    holds the gateway's ``gateway.pid``/``gateway.lock`` — so the gateway PID is resolved
+    host-wide (host rendezvous record, launch-home identity files), never via this process's
+    HERMES_HOME. A live gateway PID plus the supervised-launch markers puts a worker in the same
+    protective zone as the gateway itself: lifecycle commands it issues would take the gateway
+    down before completing.
+    """
+    if os.environ.get("_HERMES_GATEWAY") != "1":
+        return False
+    try:
+        from gateway.restart import is_supervised_gateway_launch
+        from gateway.status import get_host_gateway_pid
+
+        return is_supervised_gateway_launch() and get_host_gateway_pid() is not None
+    except Exception as exc:
+        logger.debug("Could not verify supervised gateway process identity: %s", exc)
+        return False
+
+
 def _build_systemd_scope_argv(shell_argv: list[str], unit_suffix: str) -> list[str]:
     """Wrap *shell_argv* in a ``systemd-run --user --scope`` invocation with its own
     memory accounting, so an OOM in the worker cannot kill the gateway cgroup.
