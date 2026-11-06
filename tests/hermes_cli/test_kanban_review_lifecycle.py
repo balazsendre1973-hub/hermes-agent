@@ -655,7 +655,10 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
             conn,
             title="domain review",
             assignee="reviewer",
-            skills=["domain-specific-review"],
+            # The write-gate refuses a card pinned to a skill that is not
+            # loaded (kanban_preflight.check_skills); use a skill that exists
+            # so the dispatch under test is the thing being asserted.
+            skills=["humanizer"],
         )
         implementation = kb.claim_task(conn, task_id)
         assert implementation is not None
@@ -681,7 +684,7 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
         result = kbd.dispatch_once(conn, spawn_fn=spawn)
 
     assert task_id in [task[0] for task in result.spawned]
-    assert captured == [["domain-specific-review", "sdlc-review"]]
+    assert captured == [["humanizer", "sdlc-review"]]
 
 
 def test_review_dispatch_honors_global_and_per_profile_caps(

@@ -74,9 +74,11 @@ def client(kanban_home):
 
 def test_set_and_clear_model_override(conn):
     tid = kb.create_task(conn, title="t", assignee="worker")
-    assert kb.set_model_override(conn, tid, "gpt-5.6-sol", provider="openai")
+    # A catalog-valid pair (the write-gate refuses models the provider does not
+    # offer — see hermes_cli.model_gate; gpt-4o is in openai's static catalog).
+    assert kb.set_model_override(conn, tid, "gpt-4o", provider="openai")
     t = kb.get_task(conn, tid)
-    assert t.model_override == "gpt-5.6-sol"
+    assert t.model_override == "gpt-4o"
     assert t.provider_override == "openai"
 
     # Clearing the model clears the provider too.
@@ -132,7 +134,7 @@ def test_spawn_resolves_claimed_task_policy(
     expected_model, expected_provider, expected_reasoning,
 ):
     """The worker passes identity, while the owner reads overrides from SQLite."""
-    from gateway.session_contract import Principal
+    from gateway.session_contract import SessionActor
     from gateway.session_kanban import build_kanban_policy
     from hermes_cli import kanban_worker_client
     from hermes_state_runtime import RuntimeStoreError
@@ -157,7 +159,7 @@ def test_spawn_resolves_claimed_task_policy(
     kbd._default_spawn(task, str(workspace))
     assert captured["cmd"] == [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
     assert captured["env"]["HERMES_HOME"] == str(profile)
-    actor = Principal("owner", str(profile), frozenset({"session:create"}), "transport")
+    actor = SessionActor("owner", str(profile), frozenset({"session:create"}), "transport")
     connection = SimpleNamespace(
         authority=SimpleNamespace(profile_id=str(profile)), actor=actor, native_owner=True)
     config = {"model": {"default": "profile-model", "provider": "custom"},
@@ -210,24 +212,28 @@ def _create(client, **kwargs):
 
 def test_patch_sets_model_override(client):
     task = _create(client)
+    # Catalog-valid pair: the write-gate refuses a model the provider does not
+    # offer (gpt-4o is in openai's static catalog).
     r = client.patch(
         f"/api/plugins/kanban/tasks/{task['id']}",
-        json={"model_override": "gpt-5.6-sol", "provider_override": "openai"},
+        json={"model_override": "gpt-4o", "provider_override": "openai"},
     )
     assert r.status_code == 200, r.text
     updated = r.json()["task"]
-    assert updated["model_override"] == "gpt-5.6-sol"
+    assert updated["model_override"] == "gpt-4o"
     assert updated["provider_override"] == "openai"
 
 
 def test_bulk_model_override(client):
     t1 = _create(client)
     t2 = _create(client)
+    # Catalog-valid pair: the write-gate refuses models with positive evidence
+    # of absence (z-ai/glm-5.3-flash is in nous's static catalog).
     r = client.post(
         "/api/plugins/kanban/tasks/bulk",
         json={
             "ids": [t1["id"], t2["id"]],
-            "model_override": "fallback-model",
+            "model_override": "z-ai/glm-5.3-flash",
             "provider_override": "nous",
         },
     )
@@ -235,7 +241,7 @@ def test_bulk_model_override(client):
     assert all(entry["ok"] for entry in r.json()["results"])
     for tid in (t1["id"], t2["id"]):
         got = client.get(f"/api/plugins/kanban/tasks/{tid}").json()["task"]
-        assert got["model_override"] == "fallback-model"
+        assert got["model_override"] == "z-ai/glm-5.3-flash"
         assert got["provider_override"] == "nous"
 
 

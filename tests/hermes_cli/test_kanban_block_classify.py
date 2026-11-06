@@ -35,13 +35,23 @@ def _time_out_once(conn, tid: str) -> None:
 
 
 def test_typed_block_classifies_untyped_breaker_block(kanban_home, monkeypatch):
-    """Two timeouts trip the breaker untyped; the supervisor's typed block then
-    attaches the kind without a status flap, a synthetic run, or lost evidence."""
+    """``DEFAULT_FAILURE_LIMIT`` timeouts trip the breaker untyped; the
+    supervisor's typed block then attaches the kind without a status flap, a
+    synthetic run, or lost evidence.
+
+    The threshold is read from the dispatcher (raised 2 → 3 by the stability
+    layer) instead of being hardcoded, so a limit change cannot silently turn
+    this into a wrong-count assertion.
+    """
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="ceiling", assignee="worker", max_runtime_seconds=1)
+        limit = kbd.DEFAULT_FAILURE_LIMIT
         _time_out_once(conn, tid)
         assert kb.get_task(conn, tid).status == "ready"
+        for _ in range(limit - 2):
+            _time_out_once(conn, tid)
+            assert kb.get_task(conn, tid).status == "ready"
         _time_out_once(conn, tid)
         parked = kb.get_task(conn, tid)
         assert (parked.status, parked.block_kind, parked.block_recurrences) == ("blocked", None, 0)
@@ -54,16 +64,16 @@ def test_typed_block_classifies_untyped_breaker_block(kanban_home, monkeypatch):
         assert after.last_failure_error == parked.last_failure_error
         assert after.current_run_id is None
         kinds = [e.kind for e in kb.list_events(conn, tid)]
-        assert (kinds.count("blocked"), kinds.count("gave_up"), kinds.count("timed_out")) == (1, 1, 2)
-        assert len(kb.list_runs(conn, tid)) == 2
+        assert (kinds.count("blocked"), kinds.count("gave_up"), kinds.count("timed_out")) == (1, 1, limit)
+        assert len(kb.list_runs(conn, tid)) == limit
 
 
 def test_typed_block_still_refuses_typed_or_live_blocked_cards(kanban_home, monkeypatch):
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     with kbc.connect() as conn:
         parked = kb.create_task(conn, title="parked", assignee="worker", max_runtime_seconds=1)
-        _time_out_once(conn, parked)
-        _time_out_once(conn, parked)
+        for _ in range(kbd.DEFAULT_FAILURE_LIMIT):
+            _time_out_once(conn, parked)
         assert kb.get_task(conn, parked).status == "blocked"
         stale_run_id = conn.execute(
             "SELECT MAX(id) FROM task_runs WHERE task_id = ?", (parked,)).fetchone()[0]
