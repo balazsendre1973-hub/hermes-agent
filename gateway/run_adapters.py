@@ -71,6 +71,30 @@ class GatewayAdapterLifecycleMixin:
     """Adapter lifecycle: connect/teardown, fatal recovery, reconnect watcher, multiplex profiles."""
 
     @staticmethod
+    def _is_standalone_only_platform(platform: Platform) -> bool:
+        """True when the plugin registered this platform as adapter-less by design: its
+        ``adapter_factory`` returns None but it provides a ``standalone_sender_fn`` for cron
+        delivery. Such platforms are served (no live connection needed) and must not be flagged
+        adapter_unavailable/fatal at startup, nor queued for the reconnect watcher (they cannot
+        heal by retrying). ``get()`` falls back to the process-global entries, so this is visible
+        from every profile's runtime scope."""
+        from gateway.platform_registry import platform_registry
+        entry = platform_registry.get(platform.value)
+        return entry is not None and bool(getattr(entry, "standalone_only", False))
+
+    def _mark_standalone_only_platform(self, status_key: str, platform: Platform) -> None:
+        """Non-fatal, no-attention runtime status for a standalone-only platform: enabled and
+        served via its standalone sender, but with no live gateway adapter to connect."""
+        self._update_platform_runtime_status(
+            status_key, platform_state="disabled", error_code=None,
+            error_message=(
+                f"standalone-only platform '{platform.value}': no live adapter by design; "
+                "cron delivery goes through its standalone sender"
+            ),
+            needs_attention=False,
+        )
+
+    @staticmethod
     async def _wait_or_detach(task: asyncio.Future, timeout: float) -> bool:
         """Wait up to ``timeout`` for ``task``; on deadline (or our own cancellation) detach it. Not
         ``asyncio.wait_for``: that WAITS for the cancelled child, so a connect()/close() swallowing
@@ -819,6 +843,12 @@ class GatewayAdapterLifecycleMixin:
             await self._run_in_executor_with_context(platform_registry.get, platform.value)
             adapter = self._create_adapter(platform, platform_config)
             if not adapter:
+                if self._is_standalone_only_platform(platform):
+                    # Standalone-only by design: no live adapter, but cron delivery rides the
+                    # platform's standalone sender. Not fatal, and it cannot heal by retrying.
+                    self._mark_standalone_only_platform(platform.value, platform)
+                    self._drop_from_reconnect_queue(platform, "standalone-only platform")
+                    return
                 if not self._adapter_may_heal(platform, platform_config):
                     # Became builtin/registered-but-None: a config change is needed, so stop retrying.
                     self._update_platform_runtime_status(
@@ -1310,6 +1340,12 @@ class GatewayAdapterLifecycleMixin:
                         profile_name, platform.value,
                     )
             if not adapter:
+                # Standalone-only platform (e.g. a send-only cron delivery lane): it has no live
+                # adapter BY DESIGN — its adapter_factory returns None while a standalone_sender_fn
+                # serves cron delivery out-of-process. Record the non-fatal verdict so the profile's
+                # platform is reported as served-by-standalone-sender instead of unreported.
+                if self._is_standalone_only_platform(platform):
+                    self._mark_standalone_only_platform(f"{profile_name}:{platform.value}", platform)
                 continue
             # Same-token / same-listener conflict detection — refuse a duplicate poll or bind.
             credential_claim = self._adapter_credential_claim(platform, adapter)
