@@ -100,7 +100,10 @@ def provider_stub(monkeypatch):
 def skill_stub(monkeypatch):
     import tools.skills_tool as st
 
-    state = {"payloads": {}}
+    # ``find_all_skills`` is the registry the preflight consults before it
+    # believes a "not found" verdict; a non-empty list makes the stub home an
+    # authoritative one (see test_missing_skill_fails_open_when_registry_is_empty).
+    state = {"payloads": {}, "registry": ["obsidian", "forex-mt5-workflow"]}
 
     def _view(name, *args, **kwargs):
         payload = state["payloads"].get(name)
@@ -108,7 +111,11 @@ def skill_stub(monkeypatch):
             return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
         return json.dumps(payload)
 
+    def _find_all(*args, **kwargs):
+        return [{"name": name} for name in state["registry"]]
+
     monkeypatch.setattr(st, "skill_view", _view)
+    monkeypatch.setattr(st, "find_all_skills", _find_all)
     return state
 
 
@@ -215,6 +222,22 @@ def test_missing_skill_blocks(skill_stub):
     kind, reason = verdict
     assert kind == kp.KIND_ENVIRONMENT
     assert "no-such-skill" in reason
+
+
+def test_missing_skill_fails_open_when_registry_is_empty(skill_stub):
+    """An empty/unlistable skill root answers "not found" for EVERY name —
+    real ones included — so the verdict cannot tell a typo from a fresh or
+    isolated home. The card must not be parked on it (same fail-open rule as
+    the model catalog)."""
+    skill_stub["registry"] = []
+    assert kp.check_skills(FakeTask(skills=["no-such-skill"])) is None
+
+
+def test_known_skill_name_is_never_parked_on_a_stale_not_found(skill_stub):
+    """Registry says the skill exists but skill_view cannot load it: the
+    disagreement is an environment fault, not a card fault → fail open."""
+    skill_stub["payloads"]["obsidian"] = {"success": False, "error": "Skill 'obsidian' not found."}
+    assert kp.check_skills(FakeTask(skills=["obsidian"])) is None
 
 
 def test_skill_setup_needed_blocks(skill_stub):

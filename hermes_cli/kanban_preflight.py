@@ -194,6 +194,12 @@ def check_skills(task: Any) -> Optional[tuple[str, str]]:
 
     Anything else (unreadable payload, unexpected shape, tool error) fails
     open: the worker's own skip handling covers it.
+
+    ``not found`` only blocks when the skill registry can actually be
+    enumerated (``find_all_skills``): an empty or unlistable root still
+    answers "not found" for EVERY name — including real ones — and blocking on
+    that would park cards in a fresh/isolated home for a reason that has
+    nothing to do with the card. Same fail-open rule as the model catalog.
     """
     skills = _attr(task, "skills") or []
     if not isinstance(skills, (list, tuple)) or not skills:
@@ -202,6 +208,20 @@ def check_skills(task: Any) -> Optional[tuple[str, str]]:
         from tools.skills_tool import skill_view
     except Exception:
         return None  # fail-open: skills tool unavailable in this process
+    registry: Optional[frozenset] = None
+    try:
+        from tools.skills_tool import find_all_skills
+
+        names = {
+            str(entry.get("name") or "").strip()
+            for entry in find_all_skills(skip_disabled=False)
+            if isinstance(entry, dict)
+        }
+        names.discard("")
+        if names:
+            registry = frozenset(names)
+    except Exception:
+        registry = None  # fail-open: cannot enumerate → not-found never blocks
     for name in skills:
         name = str(name).strip()
         if not name:
@@ -214,14 +234,14 @@ def check_skills(task: Any) -> Optional[tuple[str, str]]:
             continue
         if not payload.get("success"):
             error = str(payload.get("error") or "")
-            if "not found" in error.lower():
+            if "not found" in error.lower() and registry is not None and name not in registry:
                 return (
                     KIND_ENVIRONMENT,
                     f"preflight: skill {name!r} is not loaded ({error.strip()}). "
                     "Attach a skill that exists for this profile, or install it "
                     "before dispatch.",
                 )
-            continue  # other tool errors → fail-open
+            continue  # other tool errors → fail-open (and an unverifiable not-found)
         if payload.get("setup_needed") or payload.get("readiness_status") == "setup_needed":
             missing = [
                 fmt.format(skill)
