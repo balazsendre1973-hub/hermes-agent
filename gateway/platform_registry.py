@@ -191,6 +191,21 @@ def core_ships_platform(name: str) -> bool:
         value in Platform._scan_bundled_plugin_platforms()[0])
 
 
+def core_adapter_platform(name: str) -> bool:
+    """*name* is a **static** ``Platform`` member — a core-shipped adapter (telegram, discord, …),
+    unlike a bundled ``plugins/platforms/`` plugin platform, which ``core_ships_platform`` also
+    counts.
+
+    The distinction matters for flags that must not be claimed for somebody else's adapter:
+    ``standalone_only`` on a core name would re-point the startup verdict of a real adapter
+    (disabled, ``needs_attention=False``, no reconnect retry) to a plugin that has no live
+    connection. ``_member_names_`` only ever holds the enum's own members — the pseudo members
+    ``Platform._missing_`` adds for plugin platforms go into ``_member_map_``/``_value2member_map_``
+    instead — so this set stays static however late it is read."""
+    from gateway.config import Platform
+    return str(name or "").strip().lower() in {Platform[member].value for member in Platform._member_names_}
+
+
 class PlatformRegistry:
     """Central registry of platform adapters. Registrations are serialized; concurrent
     lazy lookups share an in-flight event while the loader runs outside the registry lock."""

@@ -786,9 +786,24 @@ class PluginContext(PluginCapabilityCtxMixin):
         it freely); an ACTIVE installer goes in ``ensure_deps_fn`` (called from ``create_adapter()`` when
         ``check_fn`` is False). Extra kwargs (``setup_fn``, ``emoji``, ``allowed_users_env``,
         ``platform_hint``, ``ensure_deps_fn``) forward to ``PlatformEntry``; unknown keys raise TypeError."""
-        from gateway.platform_registry import core_ships_platform, platform_registry, PlatformEntry
+        from gateway.platform_registry import core_adapter_platform, core_ships_platform, platform_registry, PlatformEntry
         if entry_kwargs.get("trusted_inbound") and self.manifest.source != "bundled" and core_ships_platform(name):
             raise self._refuse(f"core platform '{name}' with trusted_inbound (it would waive allowlists and pairing)")
+        if entry_kwargs.get("standalone_only"):
+            # A standalone-only platform has no live adapter BY DESIGN — everything that reaches
+            # its users goes through standalone_sender_fn, so registering one without a sender
+            # would leave the cron delivery it exists for failing silently. Only a bundled plugin
+            # may claim the flag (a user plugin would otherwise re-point any platform's startup
+            # verdict), and never for a core adapter: ``standalone_only`` on a core name marks
+            # that adapter disabled with needs_attention=False and drops its reconnect retry.
+            if not entry_kwargs.get("standalone_sender_fn"):
+                raise self._refuse(
+                    "standalone_only platform without standalone_sender_fn (cron delivery would fail silently)")
+            if self.manifest.source != "bundled":
+                raise self._refuse("standalone_only (only a bundled platform plugin may claim it)")
+            if core_adapter_platform(name):
+                raise self._refuse(
+                    f"core platform '{name}' with standalone_only (it would mask a real adapter's failures)")
         entry_kwargs.setdefault("plugin_name", self.manifest.name)
         entry = PlatformEntry(
             name=name, label=label, adapter_factory=adapter_factory, check_fn=check_fn,

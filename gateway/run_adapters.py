@@ -84,7 +84,16 @@ class GatewayAdapterLifecycleMixin:
 
     def _mark_standalone_only_platform(self, status_key: str, platform: Platform) -> None:
         """Non-fatal, no-attention runtime status for a standalone-only platform: enabled and
-        served via its standalone sender, but with no live gateway adapter to connect."""
+        served via its standalone sender, but with no live gateway adapter to connect.
+
+        Logged as a warning on purpose: the status below is ``disabled`` /
+        ``needs_attention=False`` and the reconnect queue drops the platform, so a wrongly
+        flagged core platform would otherwise leave the watch list without a trace."""
+        logger.warning(
+            "standalone-only platform '%s' recorded as disabled (%s): no live adapter by design, "
+            "not queued for reconnect — cron delivery goes through its standalone sender",
+            platform.value, status_key,
+        )
         self._update_platform_runtime_status(
             status_key, platform_state="disabled", error_code=None,
             error_message=(

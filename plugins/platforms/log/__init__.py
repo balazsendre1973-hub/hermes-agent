@@ -18,7 +18,58 @@ PLATFORM_NAME = "log"
 LOG_TOKEN_ENV = "LOG_TELEGRAM_TOKEN"
 LOG_CHAT_ID = "8832329921"  # Endre Balazs DM = Log csatorna
 TELEGRAM_SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
-MAX_CHUNK = 4000  # Telegram szoveglimit 4096 kodpont, biztonsagi margoval
+# A Telegram 4096-os limitje UTF-16 EGYSÉG, nem kód pont: 4000 darab astral emoji 8000
+# egység → 400 (retry_after) → a teljes kézbesítés elbukik. Ezért itt is UTF-16 a mérték.
+MAX_CHUNK = 4000  # UTF-16 egység, biztonsági margoval a 4096 alatt
+
+
+def _utf16_len(text: str) -> int:
+    """UTF-16 egységek száma — ugyanaz, mint a ``gateway/platforms/base.py`` ``utf16_lennel``.
+
+    A plugin nem importálhat gateway-modult (a betöltés a gateway folyamatában, a
+    platform-regisztráció idején történik), ezért a mérték itt él. Egy astral emoji (CJK
+    Ext B, emoji) 2 egység, amit a Python ``len()`` 1-nek számol.
+    """
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _chunk_utf16(text: str, limit: int = MAX_CHUNK) -> list[str]:
+    """``text`` darabjai, amelyek mindegyike ≤ ``limit`` UTF-16 egység.
+
+    Kód pontokra vágni (a régi ``text[i:i + MAX_CHUNK]``) 4000 emoji esetén 8000 egységes
+    darabot ad, amit a Telegram 400-zal utasít vissza. Itt az egység-szélesség szerint
+    vágunk, így egy surrogate pair (emoji) sohasem esik két darabra.
+    """
+    chunks: list[str] = []
+    start = 0
+    units = 0
+    for idx, ch in enumerate(text):
+        width = 2 if ord(ch) > 0xFFFF else 1
+        if units and units + width > limit:
+            chunks.append(text[start:idx])
+            start, units = idx, 0
+        units += width
+    if start < len(text):
+        chunks.append(text[start:])
+    return chunks
+
+
+def _redact_outbound(text: str) -> str:
+    """Titok-mentesítés a kimenő szövegen — ugyanaz a fail-closed politika, mint a
+    ``cron/scheduler_delivery._redact_cron_payload``.
+
+    A cron útvonal a lane-ek előtt redaktál, de a közvetlen útvonal (``hermes send
+    --target log``, ``tools/send_message_tool``) nem: a küldő fölött itt sem bízunk meg,
+    a ``force=True`` a biztonsági határ, amit a ``security.redact_secrets`` preferencia
+    nem kapcsolhat ki. Ha a redaktálás maga hibázik, a payload nem megy ki."""
+    if not text:
+        return text
+    try:
+        from agent.redact import redact_sensitive_text
+        return redact_sensitive_text(text, force=True)
+    except Exception as exc:
+        logger.warning("log platform: redaction failed, payload dropped: %s", exc)
+        return "[REDACTED - redaction failed]"
 
 
 def _send_one(token: str, chat_id: str, text: str):
@@ -75,19 +126,26 @@ async def log_standalone_send(
 
     Visszaadja a _send_to_platform-al kompatibilis dictet:
     {"success": True, "message_id": "..."} | {"error": "..."}.
+
+    Biztonsági határ: a payload MIELŐTT bármi mást történik redaktálva van (lásd
+    _redact_outbound), és a chunkok UTF-16 egység szerint vannak darabolva (lásd
+    _chunk_utf16) — a Telegram limitje UTF-16, nem kód pont.
     """
     del pconfig, thread_id, media_files, force_document
+    # AZ ELSŐ lépés: bármely küldő jöhet (cron, `hermes send --target log`, tool) és egy
+    # titok a szövegben egyenesen a Log csatornára menne — itt nem bízunk a küldőben.
+    message = _redact_outbound(message or "")
     token = _log_token()
     if not token:
         return {"error": f"{LOG_TOKEN_ENV} nincs beallitva a cron folyamat környezetében"}
-    message = (message or "").strip()
+    message = message.strip()
     if not message:
         return {"error": "ures uzenet"}
     target = (chat_id or "").strip() or LOG_CHAT_ID
     last_message_id = None
-    num_chunks = (len(message) + MAX_CHUNK - 1) // MAX_CHUNK
-    for chunk_start in range(0, len(message), MAX_CHUNK):
-        chunk = message[chunk_start:chunk_start + MAX_CHUNK]
+    chunks = _chunk_utf16(message)
+    num_chunks = len(chunks)
+    for chunk in chunks:
         result, err = _send_one(token, target, chunk)
         if err is not None:
             return {"error": err}
