@@ -1268,6 +1268,12 @@ class GatewayStartupMixin:
             enabled_platform_count += 1
             adapter = self._create_adapter(platform, platform_config)
             if not adapter:
+                # A standalone-only platform has no live adapter BY DESIGN (its factory returns
+                # None); cron delivery rides its standalone_sender_fn. It is served, so it must not
+                # be flagged adapter_unavailable/fatal, and it cannot heal by reconnecting.
+                if self._is_standalone_only_platform(platform):
+                    self._mark_standalone_only_platform(platform.value, platform)
+                    continue
                 # Distinguish between missing builtin deps and missing plugin
                 if platform.value in {m.value for m in Platform.__members__.values()}:
                     logger.warning("No adapter available for %s", platform.value)
