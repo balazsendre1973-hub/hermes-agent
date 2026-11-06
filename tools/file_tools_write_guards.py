@@ -12,6 +12,7 @@ whole-file overwrite of content this task never saw or that changed since.
 
 import fnmatch
 import os
+from collections.abc import Iterable
 from pathlib import Path
 
 from agent.file_safety import get_nt_namespace_error
@@ -144,6 +145,57 @@ def _resolved_or_raw(filepath: str, task_id: str) -> str:
         return filepath
 
 
+def _runtime_env_protection_reason(path: str) -> str | None:
+    """Why *path* is a runtime-environment file under the installation root, or ``None``.
+
+    (d) stability layer (t_55e6fd81): matches ``profiles/<name>/config.yaml|.yml``
+    (any profile — the hard deny in :func:`_check_sensitive_path` only covers the
+    ACTIVE one), ``cron/jobs.json``, ``agent-hooks/*.py`` and ``scripts/*.py``,
+    all resolved against the installation root (:func:`get_default_hermes_root`),
+    never the active home — profile homes live under the root regardless of which
+    profile is active. The root's own ``config.yaml`` is deliberately NOT matched:
+    it is the operator's file and stays writable.
+
+    Returns a short human label of WHAT class matched (for the refusal message)
+    or ``None`` when the path is not protected by this rule. Fails open on any
+    resolution error so an exotic layout can never wedge every write.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root_real = os.path.realpath(str(get_default_hermes_root()))
+        real = os.path.realpath(path)
+        if root_real and real.startswith(root_real + os.sep):
+            rel = Path(real[len(root_real) + 1:]).parts
+        else:
+            return None
+        if (len(rel) == 3 and rel[0] == "profiles" and rel[1] not in ("", ".", "..")
+                and rel[2] in ("config.yaml", "config.yml")):
+            return "a profile config.yaml"
+        if rel == ("cron", "jobs.json"):
+            return "the cron schedule (jobs.json)"
+        if len(rel) == 2 and rel[0] == "agent-hooks" and rel[1].endswith(".py"):
+            return "an agent hook"
+        if len(rel) == 2 and rel[0] == "scripts" and rel[1].endswith(".py"):
+            return "a runtime script"
+        return None
+    except Exception:
+        return None
+
+
+def _check_runtime_env_path(candidates: Iterable[str]) -> str | None:
+    """Hard deny for runtime-environment files (see :func:`_runtime_env_protection_reason`)."""
+    for candidate in candidates:
+        label = _runtime_env_protection_reason(candidate)
+        if label is not None:
+            return (
+                f"Refusing to write to {candidate}: {label} decides how the NEXT Hermes "
+                "start behaves (the stability layer pins runtime-environment files — "
+                "see t_55e6fd81). This is not an editable file: change profile config "
+                "via 'hermes config set', and cron/hooks/scripts via the operator.")
+    return None
+
+
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     # NT/device-namespace guard on the RAW string, BEFORE the task-base join:
@@ -171,6 +223,20 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             f"Refusing to write to Hermes config file: {filepath}\n"
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead.")
+
+    # --- (d) stability layer (t_55e6fd81): runtime-environment files ---------
+    # Files that decide how the NEXT start behaves: every profile's config.yaml,
+    # the cron schedule, agent hooks and runtime scripts. The active-config hard
+    # deny above only covers the CURRENT profile's config; this rule covers the
+    # rest of the installation root regardless of which profile is active — the
+    # measured gap was that `write_file` into another profile's config.yaml (or
+    # straight into cron/jobs.json) needed no consent at all.
+    # The installation root's OWN config.yaml is deliberately NOT matched: it is
+    # the operator's file and stays writable (only profile configs are pinned).
+    runtime_env_err = _check_runtime_env_path(candidates)
+    if runtime_env_err is not None:
+        return runtime_env_err
+
     from tools.skill_lock import path_refusal
     if reason := path_refusal(candidates):
         return f"Refusing to write to {filepath}: {reason}"
