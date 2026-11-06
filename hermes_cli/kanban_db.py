@@ -796,6 +796,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     claim_expires        INTEGER,
     tenant               TEXT,
     result               TEXT,
+    -- Registry condition key. ``reg:`` keys are normalised at entry by
+    -- create_task (lowercase, kind-less ``reg:<board>|<id>`` — NEW/new and
+    -- ERROR/error are one condition, the kind belongs to the card body), and
+    -- kanban_db_connect._ensure_reg_idempotency normalises legacy rows,
+    -- archives duplicates and then creates the partial UNIQUE index
+    -- idx_tasks_reg_idempotency (NOCASE, open reg: rows only): the DB-level
+    -- second line behind the create-time lookup.
     idempotency_key      TEXT,
     -- Unified consecutive-failure counter. Incremented on spawn
     -- failure, timeout, or crash; reset only on successful completion.
@@ -1222,13 +1229,20 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
+    # Registry keys are normalised at entry: `reg:<board>|<id>(|<kind>)` →
+    # lowercase, kind-less `reg:<board>|<id>`. NEW/new/ERROR/error are one
+    # condition — the kind belongs to the card body, not the condition id —
+    # and board case must not mint a second card. Other producers' key
+    # schemes (user:/hermes:/…) pass through untouched.
+    idempotency_key = normalize_reg_idempotency_key(idempotency_key)
+
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
-    # race may insert twice, the next lookup stabilises on the newest.
+    # race may insert twice, the next lookup stabilises on the newest. NOCASE:
+    # a row written before the migration normalised its key (or by direct SQL)
+    # still matches.
     if idempotency_key:
         row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
+            _idempotency_lookup_sql(idempotency_key), (idempotency_key,)
         ).fetchone()
         if row:
             return row["id"]
@@ -1325,9 +1339,90 @@ def create_task(
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
+            # The partial UNIQUE index on reg: keys closes the lookup→insert
+            # race: a concurrent create won between our lookup and this
+            # INSERT. Read the winner back instead of retrying (the retry
+            # would collide again) — same idempotent contract as the lookup.
+            if idempotency_key:
+                row = conn.execute(
+                    _idempotency_lookup_sql(idempotency_key), (idempotency_key,)
+                ).fetchone()
+                if row:
+                    return row["id"]
             if attempt == 1:
                 raise
     raise RuntimeError("unreachable")
+
+
+def normalize_reg_idempotency_key(key: Optional[str]) -> Optional[str]:
+    """``reg:<board>|<id>(|<kind>)`` → lowercase, kind-less ``reg:<board>|<id>``.
+
+    The kind (new/change/stall/error/paused/gone and any case or agent
+    variant: NEW/ERROR/cron_error/…) is not part of the condition id —
+    dedup happens per card, one card per error class, so the kind belongs
+    on the card body. ``task_register_sync._norm_reg_key`` is the
+    registry-side twin of this rule. Non-``reg:`` keys and malformed values
+    pass through unchanged: other producers' schemes are not ours to
+    rewrite, and a value we cannot parse must not be silently mangled.
+    """
+    if not isinstance(key, str):
+        return key
+    parts = [p.strip() for p in key.split("|")]
+    if len(parts) < 2 or not parts[1]:
+        return key
+    if not parts[0].lower().startswith("reg:"):
+        return key
+    if any(not p for p in parts):
+        return key
+    return f"{parts[0].lower()}|{parts[1].lower()}"
+
+
+# Shared by the create-time idempotency check and the insert-race read-back.
+# reg: keys (the normalised, indexed scheme) match NOCASE so a row written
+# before the migration normalised its key still matches; every other scheme
+# keeps its historic byte-exact semantics — the index only constrains reg:.
+_IDEMPOTENCY_LOOKUP_SQL = (
+    "SELECT id FROM tasks WHERE idempotency_key = ? COLLATE NOCASE "
+    "AND status != 'archived' "
+    "ORDER BY created_at DESC LIMIT 1"
+)
+_IDEMPOTENCY_LOOKUP_EXACT_SQL = (
+    "SELECT id FROM tasks WHERE idempotency_key = ? "
+    "AND status != 'archived' "
+    "ORDER BY created_at DESC LIMIT 1"
+)
+
+
+def _idempotency_lookup_sql(key: Optional[str]) -> str:
+    """NOCASE lookup for ``reg:`` keys, byte-exact for every other scheme."""
+    if isinstance(key, str) and key[:4].lower() == "reg:":
+        return _IDEMPOTENCY_LOOKUP_SQL
+    return _IDEMPOTENCY_LOOKUP_EXACT_SQL
+
+
+def count_duplicate_reg_keys(conn: sqlite3.Connection) -> int:
+    """Open ``reg:`` keys whose normalised form maps to more than one card.
+
+    The monitoring metric (t_d09381f0) for the DB-level idempotency
+    invariant: migration + partial UNIQUE index must leave this at ``0``.
+    Counts distinct duplicated conditions (groups), so one duplicated
+    condition scores 1 no matter how many cards it spawned.
+    """
+    rows = conn.execute(
+        "SELECT idempotency_key FROM tasks "
+        "WHERE idempotency_key LIKE 'reg:%' AND status != 'archived'"
+    ).fetchall()
+    seen: set[str] = set()
+    duplicated: set[str] = set()
+    for row in rows:
+        normed = normalize_reg_idempotency_key(row["idempotency_key"])
+        if normed is None:
+            continue
+        normed = normed.casefold()
+        if normed in seen:
+            duplicated.add(normed)
+        seen.add(normed)
+    return len(duplicated)
 
 
 def _board_meta_for(board: Optional[str]) -> dict:

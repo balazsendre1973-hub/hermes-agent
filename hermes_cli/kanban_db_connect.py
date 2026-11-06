@@ -995,6 +995,108 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     _rebuild_drifted_tables(conn)
 
+    # DB-level idempotency for registry cards: normalise legacy reg: keys,
+    # archive duplicate open cards, then the partial UNIQUE index. Every step
+    # is independent and fail-safe (a failure logs and continues): a migration
+    # must never stop a board from opening — worst case the index is missing
+    # and create_task's lookup stays the only line of defence.
+    _ensure_reg_idempotency(conn)
+
+
+def _ensure_reg_idempotency(conn: sqlite3.Connection) -> None:
+    """Normalise ``reg:`` keys → archive duplicates → partial UNIQUE index.
+
+    Runs on every init and is idempotent: normalisation finds nothing left to
+    change, a clean board has no duplicate groups to archive, and
+    ``IF NOT EXISTS`` skips an existing index. The index is partial on
+    ``status != 'archived'`` — exactly the rows the create-time lookup
+    considers — and NOCASE, so a case or kind variant of an open key is a
+    conflict, not a second card. Audit: losers keep their row (archived,
+    never deleted) and each gets an ``archived`` event plus an
+    ``idempotency_dedup`` event naming the kept card.
+    """
+    if "idempotency_key" not in _column_names(conn, "tasks"):
+        return
+    for step in (_normalise_reg_keys, _archive_reg_key_duplicates):
+        try:
+            step(conn)
+        except Exception:
+            # Fail-safe: log and keep going. A half-cleaned board still gets
+            # the index attempt below (which fails the same way and is also
+            # caught), and opening the board must not fail either way.
+            _kb._log.warning(
+                "kanban reg-idempotency step %s failed; continuing init",
+                step.__name__,
+                exc_info=True,
+            )
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_reg_idempotency "
+            "ON tasks(idempotency_key COLLATE NOCASE) "
+            "WHERE idempotency_key LIKE 'reg:%' AND status != 'archived'"
+        )
+    except sqlite3.Error:
+        _kb._log.warning(
+            "kanban reg idempotency UNIQUE index not created (duplicate open "
+            "reg: keys remain?); create-time lookup still dedupes",
+            exc_info=True,
+        )
+
+
+def _normalise_reg_keys(conn: sqlite3.Connection) -> None:
+    """Rewrite open ``reg:`` keys to the canonical lowercase, kind-less form."""
+    rows = conn.execute(
+        "SELECT id, idempotency_key FROM tasks "
+        "WHERE idempotency_key LIKE 'reg:%' AND status != 'archived'"
+    ).fetchall()
+    for row in rows:
+        normed = _kb.normalize_reg_idempotency_key(row["idempotency_key"])
+        if not normed or normed == row["idempotency_key"]:
+            continue
+        try:
+            # CAS on the original value: a concurrent writer's key must not be
+            # rewritten under it.
+            conn.execute(
+                "UPDATE tasks SET idempotency_key = ? WHERE id = ? AND idempotency_key = ?",
+                (normed, row["id"], row["idempotency_key"]),
+            )
+        except sqlite3.IntegrityError:
+            # A NOCASE twin already holds the canonical key; the dedup step
+            # settles the group (until then the index must not exist yet).
+            continue
+
+
+def _archive_reg_key_duplicates(conn: sqlite3.Connection) -> None:
+    """Archive every open loser of a colliding ``reg:`` group; keep the newest.
+
+    Newest wins so the survivor is the card the board already converged on
+    (and, in practice, the running card — archive_task would terminate a
+    loser's worker). Losers keep their row, archived, so history and audit
+    survive; idempotent because a clean board has no groups to process.
+    """
+    rows = conn.execute(
+        "SELECT id, idempotency_key, created_at FROM tasks "
+        "WHERE idempotency_key LIKE 'reg:%' AND status != 'archived'"
+    ).fetchall()
+    groups: dict[str, list[Any]] = {}
+    for row in rows:
+        normed = _kb.normalize_reg_idempotency_key(row["idempotency_key"]) or str(row["idempotency_key"])
+        groups.setdefault(normed.casefold(), []).append(row)
+    for normed, members in groups.items():
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda r: (r["created_at"] or 0, str(r["id"])), reverse=True)
+        winner, losers = members[0], members[1:]
+        for loser in losers:
+            if not _kb.archive_task(conn, str(loser["id"])):
+                continue
+            _kb._append_event(
+                conn,
+                str(loser["id"]),
+                "idempotency_dedup",
+                {"idempotency_key": normed, "winner": str(winner["id"]), "actor": "migration"},
+            )
+
 
 def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
     """One-shot backfill: tasks 'running' before runs existed carried
