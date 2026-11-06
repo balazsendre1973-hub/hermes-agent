@@ -287,7 +287,7 @@ The same `list` / `delete <id>` / `edit <id>` subcommands work from the in-chat 
 memory:
   memory_enabled: true
   user_profile_enabled: true
-  memory_char_limit: 2200   # ~800 tokens
+  memory_char_limit: 3000   # ~1090 tokens
   user_char_limit: 1375     # ~500 tokens
   write_approval: false     # false = write freely (default) | true = require approval
   prefetch_spill_enabled: false  # external recall stays intact unless explicitly enabled

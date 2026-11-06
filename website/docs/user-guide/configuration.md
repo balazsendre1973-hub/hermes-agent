@@ -869,7 +869,7 @@ When on, skill writes are staged under `~/.hermes/pending/skills/` and reviewed 
 memory:
   memory_enabled: true
   user_profile_enabled: true
-  memory_char_limit: 2200   # ~800 tokens
+  memory_char_limit: 3000   # ~1090 tokens
   user_char_limit: 1375     # ~500 tokens
   write_approval: false     # true = require approval before any memory write
 ```
