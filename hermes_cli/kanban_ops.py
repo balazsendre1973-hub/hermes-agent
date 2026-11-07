@@ -112,6 +112,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
+            "held_back_capacity": res.held_back_capacity,
+            "held_back_max_spawn": res.held_back_max_spawn,
             "memory_pressure": res.memory_pressure,
         }, ascii=True)
         return 0
@@ -152,6 +154,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"Rate-limited (released to ready, no failure counted): {', '.join(res.rate_limited)}")
     if res.skipped_locked:
         print("Skipped: another dispatcher holds this board's lock (no writes this tick)")
+    if res.held_back_capacity:
+        used, limit = res.held_back_capacity
+        print(
+            f"Held back: host capacity {used}/{limit} running "
+            f"(max_in_progress is host-wide) — no spawn attempted this tick"
+        )
+    if res.held_back_max_spawn:
+        used, limit = res.held_back_max_spawn
+        print(f"Held back: max_spawn {used}/{limit} running — no spawn attempted this tick")
     if res.memory_pressure:
         print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
     return 0
@@ -223,8 +234,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         if health_state["bad_ticks"] >= HEALTH_WINDOW:
             now = int(time.time())
             if now - health_state["last_warn_at"] >= 300:
-                held = kbd.describe_suppression([res])
-                held = f" Last tick held back: {held}." if held else ""
+                held = kbd.describe_stuck_suffix([res])
                 print(
                     f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
                     f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "

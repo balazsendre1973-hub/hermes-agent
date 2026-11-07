@@ -16,6 +16,13 @@ and settles what an earlier release left crossed. This does, for six kinds of cr
 6. ``sessions.json`` mirror entries whose key namespace no served profile claims — dropped, since
    the legacy import re-injects any key the routing DB lacks on every boot.
 
+Plus the LOCAL creation receipts in ``state_meta`` (``gateway.local_policy.v1:*``) whose
+``profile_id`` names a profile other than their own store's home: the boot restore refuses every
+one of them with ``profile_mismatch``, and ``--orphan-receipts`` settles each instead of leaving
+it to the ``unclaimed_namespace`` dead end its session row reports — ``retire`` (default) drops
+the receipt and leaves the guarded row's transcript as ordinary history, ``rekey`` moves the
+receipt onto this store's profile keeping its session id, ``report`` leaves them alone.
+
 Legacy ``agent:main:`` rows inside a named profile's store are reported but NOT repaired unless
 ``--legacy-main`` says how: they are either a standalone (pre-multiplex) gateway's own history that
 must be rekeyed to ``agent:<p>:`` (the #113884 incident), or a default-profile chat that leaked in
@@ -38,6 +45,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 logger = logging.getLogger(__name__)
 
 _LEGACY_MAIN_CHOICES = ("report", "rekey", "move")
+_ORPHAN_RECEIPT_CHOICES = ("retire", "rekey", "report")
 _VOICE_MODE_FILE = "gateway_voice_mode.json"
 
 
@@ -116,6 +124,9 @@ class _EmptyStore:
     def key_profiles_for_chat(self, platform, chat_id):
         return set()
 
+    def _read_all(self, sql, params=()):
+        return []  # no state.db: no receipts to find
+
 
 _EMPTY_STORE = _EmptyStore()
 
@@ -157,14 +168,18 @@ def live_gateway_homes(stores: Iterable[Store]) -> list[tuple[str, int]]:
 # ── scan ──────────────────────────────────────────────────────────────────────
 
 class RepairPlan:
-    def __init__(self, stores: list[Store], *, legacy_main: str = "report") -> None:
+    def __init__(self, stores: list[Store], *, legacy_main: str = "report",
+                 orphan_receipts: str = "retire") -> None:
         if legacy_main not in _LEGACY_MAIN_CHOICES:
             raise ValueError(f"legacy_main must be one of {_LEGACY_MAIN_CHOICES}")
+        if orphan_receipts not in _ORPHAN_RECEIPT_CHOICES:
+            raise ValueError(f"orphan_receipts must be one of {_ORPHAN_RECEIPT_CHOICES}")
         self.stores = stores
         self.by_profile = {s.profile: s for s in stores}
         self.claimed: set[str] = set(self.by_profile)
         self.routing_store = next((s for s in stores if s.routing), None)
         self.legacy_main = legacy_main
+        self.orphan_receipts = orphan_receipts
         self.multiplexes = _gateway_multiplexes(self.routing_store.home) if self.routing_store else False
         self.findings: list[Finding] = []
         self._moves: dict[tuple[Path, Path], _MoveBatch] = {}
@@ -182,6 +197,7 @@ class RepairPlan:
         for store in self.stores:
             self._scan_sessions(session, store)
             self._scan_topics(session, store)
+            self._scan_state_meta_receipts(session, store)
         for store in self.stores:
             self._scan_routing(session, store)
         if self.routing_store is not None:
@@ -275,6 +291,46 @@ class RepairPlan:
                 action=f"relabel to {row['key_profile']!r}",
                 _fix=lambda s, st=store, r=row: s.db(st).relabel_telegram_topic_rows([r])))
 
+    def _scan_state_meta_receipts(self, session: _Session, store: Store) -> None:
+        """``state_meta`` LOCAL creation receipts this store cannot serve: ``receipt.profile_id``
+        names a profile other than *store*'s own home, so the boot restore refuses each one with
+        ``profile_mismatch`` (``owned_receipt``). The transcript underneath is intact, so every
+        receipt gets a concrete settlement here instead of only its session row's
+        ``unclaimed_namespace`` dead end: ``retire`` (default) drops the receipt and leaves the row
+        as ordinary history, ``rekey`` moves the receipt onto this profile."""
+        from hermes_state_local import POLICY_PREFIX
+
+        home = str(store.home)
+        for row in session.db(store)._read_all(
+                "SELECT key, value FROM state_meta WHERE key GLOB ?", (POLICY_PREFIX + "*",)):
+            try:
+                receipt = json.loads(row["value"])
+            except (TypeError, ValueError):
+                continue
+            profile_id = receipt.get("profile_id") if isinstance(receipt, dict) else None
+            if not isinstance(profile_id, str) or profile_id == home:
+                continue
+            sid = row["key"][len(POLICY_PREFIX):]
+            route = receipt.get("route")
+            detail = (f"creation receipt for session {sid} names profile {profile_id!r} while this "
+                      f"store belongs to {home!r}"
+                      + (f"; route {route!r}" if isinstance(route, str) else ""))
+            if self.orphan_receipts == "retire":
+                self._add(Finding(
+                    "orphan_receipt", store.profile, sid, detail,
+                    action=f"retire receipt ({row['key']}); the transcript stays as history",
+                    _fix=lambda s, st=store, i=sid: {"receipts_retired": _retire_orphan_receipt(s, st, i)}))
+            elif self.orphan_receipts == "rekey":
+                self._add(Finding(
+                    "orphan_receipt", store.profile, sid, detail,
+                    action=f"rekey receipt onto {home} (profile, route and the row's key namespace)",
+                    _fix=lambda s, st=store, i=sid: {"receipts_rekeyed": _rekey_orphan_receipt(s, st, i)}))
+            else:
+                self._add(Finding(
+                    "orphan_receipt", store.profile, sid, detail,
+                    reason="its profile no longer exists; settle it with --orphan-receipts retire "
+                           "or rekey"))
+
     def _scan_routing(self, session: _Session, store: Store) -> None:
         from hermes_state_profile_repair import session_key_profile
         rows = session.db(store).list_gateway_routing_rows()
@@ -305,6 +361,12 @@ class RepairPlan:
 
     def _move_routing_row(self, session: _Session, store: Store, routing_store: Store,
                           row: dict[str, Any]) -> dict[str, int]:
+        # Re-read inside the transaction: an earlier fix in this same apply may already have
+        # settled (or rekeyed) the row, and copying the stale report back would resurrect it.
+        if not session.db(store)._read_all(
+                "SELECT 1 FROM gateway_routing WHERE scope = ? AND session_key = ?",
+                (row["scope"], row["session_key"])):
+            return {}
         adopted = session.db(routing_store).insert_gateway_routing_rows_if_absent(
             [(row["scope"], row["session_key"], row["entry_json"], row["updated_at"])])
         deleted = session.db(store).delete_gateway_routing_rows([(row["scope"], row["session_key"])])
@@ -509,15 +571,133 @@ def _drop_sessions_json_entry(path: Path, key: str) -> dict[str, int]:
     return {"sessions_json_dropped": 1}
 
 
+def _retire_orphan_receipt(session: _Session, store: Store, sid: str) -> int:
+    """Drop *sid*'s LOCAL creation receipt, so the boot restore stops refusing the row with
+    ``profile_mismatch``. The ``sessions``/``messages`` rows underneath are untouched: a retired
+    receipt leaves the conversation as ordinary history. Re-derives the target inside the
+    transaction — never trusts a stale report."""
+    from hermes_state_local import POLICY_PREFIX
+
+    home = str(store.home)
+
+    def _do(conn):
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (POLICY_PREFIX + sid,)).fetchone()
+        if row is None:
+            return 0
+        try:
+            receipt = json.loads(row[0])
+        except (TypeError, ValueError):
+            return 0
+        if not isinstance(receipt, dict) or receipt.get("profile_id") == home:
+            return 0  # already this store's own receipt: the report was stale
+        return conn.execute("DELETE FROM state_meta WHERE key = ?", (POLICY_PREFIX + sid,)).rowcount
+
+    return session.db(store)._execute_write(_do)
+
+
+def _rekey_orphan_receipt(session: _Session, store: Store, sid: str) -> int:
+    """Move *sid*'s LOCAL receipt onto *store*'s profile, keeping the session id.
+
+    A receipt's id is ``local_identity(profile_id, principal_id, request_id)``: rewriting only
+    ``profile_id`` would strand the receipt (its id no longer derives from it) and re-deriving the
+    id would strand the row it guards — messages, admissions and worker history all key on it. So
+    the id stays and is recorded as the row's legacy identity (``gateway.local_legacy.v1:<sid>``,
+    the store's own mechanism for a session id that is not derived from its receipt), and the
+    row's key namespace moves to this profile exactly as ``rekey_profile_state`` does for a rename.
+    """
+    from gateway.session import _session_key_namespace
+    from hermes_state_local import POLICY_PREFIX
+    from hermes_state_local_migration import LEGACY_PREFIX
+    from hermes_state_runtime import _json
+
+    home = str(store.home)
+
+    def _do(conn):
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (POLICY_PREFIX + sid,)).fetchone()
+        if row is None:
+            return 0
+        receipt = json.loads(row[0])
+        if receipt.get("profile_id") == home:
+            return 0  # already rekeyed
+        if receipt.get("session_id") != sid:
+            raise ValueError(f"its session id {receipt.get('session_id')!r} is not its key")
+        route = receipt.get("route")
+        if not isinstance(route, str) or not route.startswith("agent:") or route.count(":") < 2:
+            raise ValueError(f"route {route!r} is not an agent: key")
+        new_route = _session_key_namespace(store.profile) + ":" + route.split(":", 2)[2]
+        if new_route != route and conn.execute(
+                "SELECT 1 FROM sessions WHERE session_key = ? AND id <> ?",
+                (new_route, sid)).fetchone() is not None:
+            raise ValueError(f"{new_route} is already owned by another row")
+        receipt["profile_id"] = home
+        receipt["legacy_session_id"] = sid
+        receipt["route"] = new_route
+        entry = receipt.get("entry")
+        if isinstance(entry, dict):
+            entry["session_key"] = new_route
+            entry["session_id"] = sid
+        _rekey_profile_refs(receipt, store.profile)
+        conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (_json(receipt), POLICY_PREFIX + sid))
+        conn.execute("INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
+                     (LEGACY_PREFIX + sid, _json({"session_id": sid, "profile_id": home,
+                                                  "principal_id": receipt.get("principal_id"),
+                                                  "legacy_session_id": sid})))
+        conn.execute("UPDATE sessions SET session_key = ?, profile_name = ? WHERE id = ?",
+                     (new_route, store.profile, sid))
+        stored = conn.execute("SELECT origin_json FROM sessions WHERE id = ?", (sid,)).fetchone()
+        if stored is not None and stored[0]:
+            try:
+                origin = json.loads(stored[0])
+            except (TypeError, ValueError):
+                origin = None
+            if isinstance(origin, dict):
+                _rekey_profile_refs(origin, store.profile)
+                conn.execute("UPDATE sessions SET origin_json = ? WHERE id = ?",
+                             (json.dumps(origin, ensure_ascii=False), sid))
+        for routing in conn.execute("SELECT scope, entry_json FROM gateway_routing WHERE session_key = ?",
+                                    (route,)).fetchall():
+            body = None
+            if routing["entry_json"]:
+                try:
+                    body = json.loads(routing["entry_json"])
+                except (TypeError, ValueError):
+                    body = None
+            if isinstance(body, dict):
+                if isinstance(body.get("session_key"), str):
+                    body["session_key"] = new_route
+                _rekey_profile_refs(body, store.profile)
+                body = json.dumps(body, ensure_ascii=False)
+            conn.execute("UPDATE gateway_routing SET session_key = ?, entry_json = ? "
+                         "WHERE scope = ? AND session_key = ?",
+                         (new_route, body, routing["scope"], route))
+        return 1
+
+    return session.db(store)._execute_write(_do)
+
+
+def _rekey_profile_refs(payload: Any, profile: str) -> None:
+    """Rewrite every ``profile`` field inside a receipt / origin / routing-entry JSON body to
+    *profile*: the old home's name is stamped in ``origin.profile`` and ``policy.source.profile``,
+    and leaving either would read the row back as another profile's."""
+    if isinstance(payload, dict):
+        if payload.get("profile"):
+            payload["profile"] = profile
+        for value in payload.values():
+            _rekey_profile_refs(value, profile)
+    elif isinstance(payload, list):
+        for value in payload:
+            _rekey_profile_refs(value, profile)
+
+
 # ── entry points ──────────────────────────────────────────────────────────────
 
 def scan_stores(stores: Optional[list[Store]] = None, *, legacy_main: str = "report",
-                read_only: bool = True) -> tuple[RepairPlan, _Session]:
+                orphan_receipts: str = "retire", read_only: bool = True) -> tuple[RepairPlan, _Session]:
     """Open every store and build the plan. The caller owns the returned session (close it)."""
     stores = enumerate_stores() if stores is None else stores
     session = _Session(read_only=read_only)
     try:
-        plan = RepairPlan(stores, legacy_main=legacy_main).scan(session)
+        plan = RepairPlan(stores, legacy_main=legacy_main, orphan_receipts=orphan_receipts).scan(session)
     except Exception:
         session.close()
         raise

@@ -62,6 +62,10 @@ def _task_in(client, src: str) -> str:
             assert kb.request_review(conn, tid, summary="s", force=True)
         elif src == "done":
             assert kb.complete_task(conn, tid, summary="s", force=True)
+        elif src == "revoked-by-Fin":
+            # The veto column is reached only through its own PATCH verb (no kb.* verb),
+            # exactly like a Fin veto would: direct write from the fresh card's column.
+            assert client.patch(f"/k/tasks/{tid}", json={"status": src}).status_code == 200
         elif src == kw.ARCHIVED:
             assert kb.archive_task(conn, tid)
         assert kb.get_task(conn, tid).status == src

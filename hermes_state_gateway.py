@@ -171,6 +171,350 @@ def _optional_table_columns(conn) -> dict[str, set[str]]:
     }
 
 
+def _profile_home_for_purge(name: str) -> Optional[Path]:
+    """Absolute HERMES_HOME of *name*'s profile — the ``receipt.profile_id`` every LOCAL creation
+    receipt made under that profile carries. Resolved OUTSIDE the write transaction (path work and
+    a CLI import do not belong in it), and None when the name does not resolve to a home (invalid
+    name, ``hermes_cli`` unavailable): the rest of the purge then still settles the identity by
+    name, rather than the whole purge failing on a lookup the name-based rows do not need.
+    """
+    try:
+        from hermes_cli.profiles import get_profile_dir
+        return Path(get_profile_dir(name))
+    except Exception:
+        logger.debug("profile home for purge of %r could not be resolved", name, exc_info=True)
+        return None
+
+
+def _profile_home_for_rekey(name: str) -> Optional[Path]:
+    """Absolute HERMES_HOME of *name*'s profile — the ``receipt.profile_id`` every LOCAL creation
+    receipt made under that profile carries. Resolved OUTSIDE the write transaction (path work and
+    a CLI import do not belong in it), mirroring :func:`_profile_home_for_purge`; None when the
+    name does not resolve (invalid name, ``hermes_cli`` unavailable), in which case receipts can
+    neither be matched nor their session ids re-derived — the rename then warns instead of guessing.
+    """
+    try:
+        from hermes_cli.profiles import get_profile_dir
+        return Path(get_profile_dir(name))
+    except Exception:
+        logger.debug("profile home for rekey of %r could not be resolved", name, exc_info=True)
+        return None
+
+
+# References a re-derived LOCAL receipt id has to move with it, or the receipt would name a session
+# nothing owns. The exact-id columns are compared for equality; the key/JSON columns embed the id
+# inside a route, an origin, a lineage or a model-config reset and go through ``replace``.
+_SID_ID_COLUMNS = (
+    ("sessions", "id"),
+    ("sessions", "chat_id"),
+    ("sessions", "parent_session_id"),
+    ("messages", "session_id"),
+    ("session_admissions", "target_session_id"),
+    ("session_model_usage", "session_id"),
+    ("worker_executions", "session_id"),
+    ("compression_locks", "session_id"),
+    ("async_delegations", "origin_session"),
+    ("async_delegations", "origin_session_id"),
+    ("async_delegations", "parent_session_id"),
+    ("async_delegations", "origin_ui_session_id"),
+    ("hosted_room_remote_runs", "session_id"),
+    ("telegram_dm_topic_bindings", "session_id"),
+)
+_SID_KEY_COLUMNS = (
+    ("sessions", "session_key"),
+    ("sessions", "origin_json"),
+    ("sessions", "model_config"),
+    ("session_admissions", "lineage_json"),
+    ("gateway_routing", "session_key"),
+    ("gateway_routing", "entry_json"),
+    ("conversation_generations", "session_key"),
+    ("gateway_hygiene_state", "session_key"),
+    ("delivery_obligations", "session_key"),
+    ("telegram_dm_topic_bindings", "session_key"),
+)
+# The receipt keys that *name* the profile (``entry.origin.profile``, ``policy.kanban_json``'s
+# ``{"profile": ...}``): only those take a name substitution, so a config value, a prompt or a
+# frozen request that merely happens to equal the old name is left alone.
+_PROFILE_NAME_FIELDS = frozenset({"profile", "profile_name"})
+
+
+def _rekey_receipt_value(
+    value: Any, *, field, old_ns, new_ns, old_name, new_name, old_home, new_home, sid_map,
+) -> Any:
+    """Rewrite profile identity inside one receipt value, recursing into nested JSON.
+
+    A string carries the rename as itself: the ``agent:<old>:`` route prefix, every re-derived
+    session id, the profile home (exact match), and the profile name — the last only under a
+    ``profile``/``profile_name`` key. A string that *encodes* a JSON object or array is rewritten
+    inside and re-encoded only when the rewrite changed it, so an untouched frozen request keeps
+    its exact bytes while ``policy.kanban_json``'s profile reference still moves.
+    """
+    if isinstance(value, dict):
+        return {
+            key: _rekey_receipt_value(
+                item, field=key, old_ns=old_ns, new_ns=new_ns, old_name=old_name,
+                new_name=new_name, old_home=old_home, new_home=new_home, sid_map=sid_map)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _rekey_receipt_value(
+                item, field=None, old_ns=old_ns, new_ns=new_ns, old_name=old_name,
+                new_name=new_name, old_home=old_home, new_home=new_home, sid_map=sid_map)
+            for item in value
+        ]
+    if not isinstance(value, str):
+        return value
+    text = value
+    if old_ns and old_ns in text:
+        text = text.replace(old_ns, new_ns)
+    for old_sid, new_sid in sid_map.items():
+        if old_sid in text:
+            text = text.replace(old_sid, new_sid)
+    if field in _PROFILE_NAME_FIELDS and text == old_name:
+        text = new_name
+    elif text == old_home:
+        text = new_home
+    try:
+        decoded = json.loads(text)
+    except (TypeError, ValueError):
+        return text
+    if not isinstance(decoded, (dict, list)):
+        return text
+    rewritten = _rekey_receipt_value(
+        decoded, field=field, old_ns=old_ns, new_ns=new_ns, old_name=old_name,
+        new_name=new_name, old_home=old_home, new_home=new_home, sid_map=sid_map)
+    return text if rewritten == decoded else json.dumps(rewritten, ensure_ascii=False)
+
+
+def _rekey_sid_state_meta(conn, sid_map: dict[str, str]) -> dict[str, int]:
+    """Rekey every *other* ``state_meta`` row a re-derived session id is written into — a
+    viewer-close receipt, an API binding or declared key, a deletion fence — so nothing in the
+    store still addresses the id the receipt no longer has. Creation receipts are skipped: the
+    receipt pass rewrites those itself, profile identity and all."""
+    from hermes_state_local import POLICY_PREFIX
+    moved = 0
+    for key, value in conn.execute("SELECT key, value FROM state_meta").fetchall():
+        if key.startswith(POLICY_PREFIX):
+            continue
+        new_key, new_value = key, value or ""
+        for old_sid, new_sid in sid_map.items():
+            if old_sid in new_key:
+                new_key = new_key.replace(old_sid, new_sid)
+            if old_sid in new_value:
+                new_value = new_value.replace(old_sid, new_sid)
+        if new_key == key and new_value == value:
+            continue
+        if new_key != key and conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?", (new_key,)).fetchone():
+            # Something already owns the re-derived key: the row that arrived under it is the
+            # current one, so the stale row goes rather than clobbering it.
+            conn.execute("DELETE FROM state_meta WHERE key = ?", (key,))
+        else:
+            conn.execute(
+                "UPDATE state_meta SET key = ?, value = ? WHERE key = ?",
+                (new_key, new_value, key))
+        moved += 1
+    return {"state_meta_sid_refs": moved} if moved else {}
+
+
+def _rekey_receipt_plan(rows, *, old: str, new: str, home: str):
+    """``(plan, sid_map)`` for this profile's LOCAL receipts: parse, classify, re-derive each id.
+
+    A plan entry is ``(old key, receipt, new key, legacy?)``. A legacy receipt's id is its
+    pre-unified id rather than a hash of the home, so only its home moves — the binding row that
+    mirrors it is re-based separately by :func:`_write_local_receipt_rekey`. A receipt whose
+    identity cannot be derived is left unrekeyed (and named in the log) rather than guessed at.
+    """
+    from hermes_state_keys import local_identity
+    from hermes_state_local import POLICY_PREFIX
+
+    sid_map: dict[str, str] = {}
+    plan: list[tuple[str, dict, str, bool]] = []
+    for key, value in rows:
+        try:
+            receipt = json.loads(value)
+        except (TypeError, ValueError):
+            receipt = None
+        if not isinstance(receipt, dict):
+            logger.warning("profile %r: malformed LOCAL receipt at %s left unrekeyed", old, key)
+            continue
+        legacy = "legacy_session_id" in receipt
+        old_sid, principal = receipt.get("session_id"), receipt.get("principal_id")
+        request = receipt.get("request_id")
+        if legacy:
+            plan.append((key, receipt, key, True))
+            continue
+        if not (isinstance(old_sid, str) and isinstance(principal, str)
+                and isinstance(request, str)):
+            logger.warning(
+                "profile %r: LOCAL receipt %s has no derivable identity left unrekeyed", old, key)
+            continue
+        new_sid = local_identity(home, principal, request)
+        if new_sid != old_sid:
+            sid_map[old_sid] = new_sid
+        plan.append((key, receipt, POLICY_PREFIX + new_sid, False))
+    return plan, sid_map
+
+
+def _rekey_legacy_bindings(conn, sids: list[str], *, old: str, new: str, old_ns: str,
+                           new_ns: str, target: str, home: str) -> dict[str, int]:
+    """Re-base the ``gateway.local_legacy.v1:`` rows the planned legacy receipts mirror.
+
+    ``legacy_lineage_root`` re-reads the binding row and compares it field by field with the
+    receipt, so a re-based receipt whose binding kept the old home would refuse to restore.
+    """
+    from hermes_state_local_migration import LEGACY_PREFIX
+    moved = 0
+    for sid in sids:
+        row = conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (LEGACY_PREFIX + sid,)).fetchone()
+        if row is None:
+            continue
+        try:
+            binding = json.loads(row[0])
+        except (TypeError, ValueError):
+            continue
+        rewritten = _rekey_receipt_value(
+            binding, field=None, old_ns=old_ns, new_ns=new_ns, old_name=old, new_name=new,
+            old_home=target, new_home=home, sid_map={})
+        if isinstance(rewritten, dict):
+            rewritten["profile_id"] = home
+        if rewritten != binding:
+            conn.execute(
+                "UPDATE state_meta SET value = ? WHERE key = ?",
+                (json.dumps(rewritten, ensure_ascii=False), LEGACY_PREFIX + sid))
+            moved += 1
+    return {"state_meta_legacy_bindings": moved} if moved else {}
+
+
+def _write_local_receipt_rekey(conn, plan, *, sid_map: dict[str, str], old: str, new: str,
+                               old_ns: str, new_ns: str, target: str, home: str) -> dict[str, int]:
+    """Write the planned rebased receipts, then their legacy bindings. See the plan's contract."""
+    moved = superseded = 0
+    legacy_bindings: list[str] = []
+    for old_key, receipt, new_key, legacy in plan:
+        if new_key != old_key and conn.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?", (new_key,)).fetchone():
+            # The re-derived id already owns a receipt: that fresher one is this session's
+            # identity, so the stale receipt goes — and the session rows it would have moved are
+            # left with the superseded receipt, not folded into a live session's id.
+            conn.execute("DELETE FROM state_meta WHERE key = ?", (old_key,))
+            sid = receipt.get("session_id")
+            sid_map.pop(sid, None)
+            superseded += 1
+            continue
+        own_sid = receipt.get("session_id")
+        own_map = {own_sid: sid_map[own_sid]} if not legacy and own_sid in sid_map else {}
+        rewritten = _rekey_receipt_value(
+            receipt, field=None, old_ns=old_ns, new_ns=new_ns, old_name=old, new_name=new,
+            old_home=target, new_home=home, sid_map=own_map)
+        rewritten["profile_id"] = home  # the authoritative home, whatever spelling it was stored in
+        conn.execute(
+            "UPDATE state_meta SET key = ?, value = ? WHERE key = ?",
+            (new_key, json.dumps(rewritten, ensure_ascii=False), old_key))
+        moved += 1
+        if legacy:
+            legacy_bindings.append(str(own_sid or ""))
+    counts: dict[str, int] = {"state_meta_receipts": moved}
+    if superseded:
+        counts["state_meta_receipts_superseded"] = superseded
+    if legacy_bindings:
+        counts.update(_rekey_legacy_bindings(
+            conn, legacy_bindings, old=old, new=new, old_ns=old_ns, new_ns=new_ns,
+            target=target, home=home))
+    return counts
+
+
+def _rekey_session_ids(conn, sid_map: dict[str, str], *, existing: set[str]) -> dict[str, int]:
+    """Move every reference to a re-derived session id onto the id its receipt now carries.
+
+    Children and parents both carry the old id, so no UPDATE order satisfies the immediate
+    foreign keys: defer them to COMMIT (SQLite resets the pragma there) and move every reference
+    inside this one transaction.
+    """
+    if not sid_map:
+        return {}
+    conn.execute("PRAGMA defer_foreign_keys=ON")
+    counts: dict[str, int] = {}
+    columns: dict[str, set[str]] = {}
+
+    def table_columns(table: str) -> set[str]:
+        if table not in columns:
+            columns[table] = {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')")}
+        return columns[table]
+
+    for table, column in _SID_ID_COLUMNS + _SID_KEY_COLUMNS:
+        if table not in existing or column not in table_columns(table):
+            continue
+        exact = column in {name for _, name in _SID_ID_COLUMNS}
+        for old_sid, new_sid in sid_map.items():
+            if exact:
+                params, sql = (new_sid, old_sid), (f"UPDATE {table} SET {column} = ? "
+                                                   f"WHERE {column} = ?")
+            else:
+                params = (old_sid, new_sid, f"%{old_sid}%")
+                sql = (f"UPDATE {table} SET {column} = replace({column}, ?, ?) "
+                       f"WHERE {column} LIKE ?")
+            count = conn.execute(sql, params).rowcount
+            if count:
+                key = f"{table}_{column}"
+                counts[key] = counts.get(key, 0) + count
+    counts.update(_rekey_sid_state_meta(conn, sid_map))
+    return counts
+
+
+def _rekey_local_receipts(
+    conn, *, existing: set[str], old: str, new: str, old_ns: str, new_ns: str,
+    old_home: Optional[Path], new_home: Optional[Path],
+) -> dict[str, int]:
+    """Rebase this profile's LOCAL creation receipts onto its renamed home (rename side, #111926).
+
+    A receipt's identity is ``(profile_id, principal_id, request_id)``: ``local_identity`` derives
+    the session id from it, so re-basing ``profile_id`` without re-deriving the id would leave a
+    receipt that no longer names its own session — ``owned_receipt`` recomputes the id from the
+    home it reads and ``validate_local_lineage`` derives it again. The re-derived id therefore
+    moves every reference to the old one (the receipt's key and nested route/origin fields, the
+    session row and its transcript, admissions, usage, routing, the receipt keys) so the
+    conversation the receipt guards stays restorable instead of pointing at an id nothing owns.
+
+    Only receipts whose ``profile_id`` names this profile's home are touched: another profile's
+    receipt in the shared store is not identity of this rename. A receipt already superseded under
+    the re-derived id (a create that landed after the rename) is dropped, never clobbered, and its
+    old session is left alone with it. Returns this phase's counts; empty when there is nothing
+    to rekey.
+    """
+    from hermes_state_local import POLICY_PREFIX, _normalize_home, _receipt_profile_home
+
+    counts: dict[str, int] = {}
+    target = _normalize_home(old_home) if old_home is not None else None
+    home = _normalize_home(new_home) if new_home is not None else None
+    if target is None or home is None:
+        # No home, no identity: the receipts can neither be matched nor re-derived. Say so rather
+        # than leaving the rename silently half-applied.
+        pending = conn.execute(
+            "SELECT count(*) FROM state_meta WHERE key GLOB ? AND value LIKE ?",
+            (POLICY_PREFIX + "*", "%" + old_ns + "%")).fetchone()[0]
+        if pending:
+            logger.warning(
+                "profile %r: %d LOCAL receipt(s) left unrekeyed — the profile home did not resolve",
+                old, pending)
+        return counts
+    rows = [
+        (key, value) for key, value in conn.execute(
+            "SELECT key, value FROM state_meta WHERE key GLOB ?", (POLICY_PREFIX + "*",))
+        if _receipt_profile_home(value) == target
+    ]
+    if not rows:
+        return counts
+    plan, sid_map = _rekey_receipt_plan(rows, old=old, new=new, home=home)
+    counts.update(_write_local_receipt_rekey(
+        conn, plan, sid_map=sid_map, old=old, new=new, old_ns=old_ns, new_ns=new_ns,
+        target=target, home=home))
+    counts.update(_rekey_session_ids(conn, sid_map, existing=existing))
+    return counts
+
+
 _HANDOFF_FAIL_SQL = "UPDATE sessions SET handoff_state = 'failed', handoff_error = ? WHERE "
 
 
@@ -671,13 +1015,21 @@ class SessionGatewayMixin:
         self._write_sql("DELETE FROM gateway_hygiene_state WHERE session_key = ?", (session_key,))
 
     def rekey_profile_state(self, old_name: str, new_name: str) -> dict[str, int]:
-        """Atomically rewrite exact profile identity in this state database."""
+        """Atomically rewrite exact profile identity in this state database.
+
+        The name-keyed rows (routing, session keys, origins) move by name; the LOCAL creation
+        receipts under ``gateway.local_policy.v1:`` carry the profile's *home* instead, so they are
+        rebased onto it in the same transaction and their session id re-derived from it — see
+        :func:`_rekey_local_receipts`.
+        """
         old, new = (old_name or "").strip(), (new_name or "").strip()
         counts: dict[str, int] = {}
         if not old or not new or old == new:
             return counts
         old_ns, new_ns = f"agent:{old}:", f"agent:{new}:"
         ns_len = len(old_ns)
+        # Resolved before the write transaction: path work and a CLI import do not belong in it.
+        old_home, new_home = _profile_home_for_rekey(old), _profile_home_for_rekey(new)
 
         def _do(conn):
             existing = {row[0] for row in conn.execute(
@@ -776,6 +1128,10 @@ class SessionGatewayMixin:
                     (new_session_key, new_json, rowid))
             counts["gateway_routing"] = len(routing)
 
+            counts.update(_rekey_local_receipts(
+                conn, existing=existing, old=old, new=new, old_ns=old_ns, new_ns=new_ns,
+                old_home=old_home, new_home=new_home))
+
         self._execute_write(_do)
         return counts
 
@@ -800,6 +1156,11 @@ class SessionGatewayMixin:
           removes the profile's own home, ``state.db`` included, with the directory. Rows in a shared
           store keep whatever ownership they had; re-binding or archiving them belongs to the flow
           that recreates the name, not to this purge.
+        * ``state_meta`` LOCAL creation receipts (``gateway.local_policy.v1:<session_id>``) whose
+          ``profile_id`` names this profile's home are hard-deleted with the name — a creation
+          receipt is identity (the launch request and route of a profile whose directory is gone),
+          not history, and nothing else ever retires it. A receipt naming another profile's home
+          in the same shared store is that profile's identity and stays.
 
         Idempotent.
         """
@@ -808,6 +1169,7 @@ class SessionGatewayMixin:
         if not name:
             return counts
         ns, ns_len = f"agent:{name}:", len(f"agent:{name}:")
+        home = _profile_home_for_purge(name)
 
         def _do(conn):
             existing = {row[0] for row in conn.execute(
@@ -847,6 +1209,9 @@ class SessionGatewayMixin:
                 counts["telegram_dm_topic_bindings"] = conn.execute(
                     "DELETE FROM telegram_dm_topic_bindings "
                     f"WHERE {by_profile}substr(session_key, 1, ?) = ?", params).rowcount
+            if home is not None and "state_meta" in existing:
+                from hermes_state_local import purge_local_receipts
+                counts["state_meta"] = purge_local_receipts(conn, home)
 
         self._execute_write(_do)
         return counts

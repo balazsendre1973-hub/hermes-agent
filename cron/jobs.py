@@ -2331,6 +2331,18 @@ def remove_job(job_id: str) -> bool:
             clear_notepad(canonical_id)
         except Exception:
             logger.debug("Failed to clear notepad for removed job %s", canonical_id, exc_info=True)
+        # Phase 3b (T2 §3.2): a deleted job can never run again, so its open incidents can
+        # never auto-resolve — close them in the same operation instead of leaving forever-
+        # "open" rows in ``hermes cron incidents``. Deletion is the operator's ack.
+        try:
+            from cron.incidents import close_incidents_for_deleted_job
+            closed = close_incidents_for_deleted_job(canonical_id)
+            if closed:
+                logger.debug(
+                    "Closed %d open incident(s) for removed job %s", closed, canonical_id)
+        except Exception:
+            logger.debug(
+                "Failed closing incidents for removed job %s", canonical_id, exc_info=True)
         # Prune the fire-fence lock entry so the registry doesn't grow monotonically.
         _fence_key = f"{_current_cron_store().cron_dir.resolve()}::{canonical_id}"
         with _fire_fence_locks_guard:

@@ -26,7 +26,6 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
-from hermes_cli import kanban_bgproc as _bgproc
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -162,20 +161,34 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    held_back_capacity: Optional[tuple[int, int]] = None
+    """``(total_running, max_in_progress)`` when the HOST-level concurrency cap
+    refused the whole tick. This is the silent case: every slot is legitimately
+    occupied on some board, so nothing on THIS board explains a zero-spawn tick
+    and no per-task guard fired — without it the "dispatcher stuck" warning
+    came out reason-less while ``hermes kanban tail`` showed only ``created``.
+    ``None`` whenever any capacity remained."""
+    held_back_max_spawn: Optional[tuple[int, int]] = None
+    """``(running_count, max_spawn)`` when the per-board ``max_spawn`` cap
+    refused the whole tick — kept apart from :attr:`held_back_capacity` so the
+    suppression line names the knob that has to move."""
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
 
-    ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
-    memory_pressure=critical`` — the respawn-guard reasons counted per task
-    plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
+    ``active_pr=1, recent_success=2, capacity=8/8, rate_limited=1,
+    skipped_locked=1, memory_pressure=critical`` — the respawn-guard reasons
+    counted per task plus the tick-level holds (host capacity, board
+    ``max_spawn``, lock, memory). Feeds the "dispatcher stuck" warnings of the
     CLI daemon and the embedded gateway dispatcher, which otherwise report a
     bare zero-spawn count while ``hermes kanban tail`` is the only place the
     guard reason is written (#111910).
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
+    capacity: Optional[str] = None
+    board_cap: Optional[str] = None
     for res in results:
         if res is None:
             continue
@@ -187,10 +200,37 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
+        # First non-None wins: the gateway summarizes EVERY board's tick in one
+        # line, and a board with no ready work reports None — last-wins would
+        # drop a real hold whenever an idle board sorted after the held one.
+        # The host cap is board-independent, so the values agree anyway.
+        if capacity is None and res.held_back_capacity is not None:
+            used, limit = res.held_back_capacity
+            capacity = f"capacity={used}/{limit}"
+        if board_cap is None and res.held_back_max_spawn is not None:
+            used, limit = res.held_back_max_spawn
+            board_cap = f"max_spawn={used}/{limit}"
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
+    if capacity:
+        parts.append(capacity)
+    if board_cap:
+        parts.append(board_cap)
     if pressure:
         parts.append(f"memory_pressure={pressure}")
     return ", ".join(parts)
+
+
+def describe_stuck_suffix(results: Iterable[Optional[DispatchResult]]) -> str:
+    """``" Last tick held back: capacity=8/8."`` for the "dispatcher stuck"
+    health warning — ``""`` when nothing withheld the tick.
+
+    The single source of that suffix (gateway watcher + CLI daemon used to
+    build it inline): an empty hold must stay suffix-less, because a warning
+    that names no reason sends the operator hunting PATH/venv/credentials while
+    the host is simply at its concurrency cap.
+    """
+    held = describe_suppression(results)
+    return f" Last tick held back: {held}." if held else ""
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -567,6 +607,54 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
         reaped.append(row["task_id"])
 
 
+def _worker_survived_termination(termination: dict) -> bool:
+    """True when we tried to kill our own host-local worker and it is still alive.
+
+    Reclaiming then would release the claim and spawn a second worker while the
+    first still runs — the duplication loop. Only host-local workers we actually
+    signalled count; a non-local lock or no-op attempt (no ``os.kill``) must fall
+    through to the normal release path since we cannot manage that worker anyway.
+    """
+    return bool(
+        termination.get("host_local")
+        and (termination.get("termination_attempted") or termination.get("signal_refused"))
+        and not termination.get("terminated")
+    )
+
+
+def _defer_reclaim_for_live_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    claim_lock: Optional[str],
+    now: int,
+    termination: dict,
+    *,
+    reason: str,
+) -> None:
+    """Hold a claim whose worker survived termination instead of releasing it.
+
+    Extends ``claim_expires`` by ``RECLAIM_DEFER_GRACE_SECONDS`` so the task
+    stays ``running`` (no duplicate spawn) and records ``reclaim_deferred``.
+    The next tick retries the kill; not spawning a duplicate is what lets the
+    throttled worker finally die.
+    """
+    grace = now + _kb.RECLAIM_DEFER_GRACE_SECONDS
+    with _kb.write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET claim_expires = ? "
+            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
+            (grace, task_id, claim_lock),
+        )
+        if cur.rowcount != 1:
+            return
+        run_id = _kb._current_run_id(conn, task_id)
+        if run_id is not None:
+            conn.execute("UPDATE task_runs SET claim_expires = ? WHERE id = ?", (grace, run_id))
+        payload = {"reason": reason, "claim_lock": claim_lock, "claim_expires_now": grace}
+        payload.update(termination)
+        _kb._append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+
+
 def heartbeat_worker(
     conn: sqlite3.Connection,
     task_id: str,
@@ -664,10 +752,6 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 killed = _sigkill(kill, pid)
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
-        # t_639b6d1d: a live child outlives the worker just killed — park
-        # `blocked (transient)` instead of requeueing a twin beside it.
-        if _bgproc.park_for_live_background(conn, tid, stage="timed_out", exclude_pid=pid):
-            continue
         with _kb.write_txn(conn):
             # Again under the write lock, after the kill wait: an interpreter that bound
             # meanwhile is invisible to the pid/claim CAS below. Host-local by the filter above.
@@ -770,8 +854,8 @@ def detect_stale_running(
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
-        if _bgproc._worker_survived_termination(termination):
-            _bgproc._defer_reclaim_for_live_worker(
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
                 conn, tid, lock, now, termination,
                 reason="heartbeat_stale_worker_alive",
             )
@@ -1224,9 +1308,6 @@ class _CrashSweep:
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
-    # t_639b6d1d: detection runs under the reclaim txn, the park after it —
-    # ``block_task`` opens its own write transaction and nesting is refused.
-    parked: list[tuple[str, int]] = []
     with _kb.write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
@@ -1256,11 +1337,6 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
             apply_attempt_note(conn, row["id"], pid, dead)
-            # t_639b6d1d: the worker is dead but a process it started is not —
-            # requeueing would run the same work twice (measured on t_8e9d4fd0).
-            if _bgproc.live_background_processes(conn, row["id"], exclude_pid=pid):
-                parked.append((row["id"], pid))
-                continue
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1304,10 +1380,6 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
-    # Parked outside the reclaim txn (see above): each card gets its own
-    # ``blocked (transient)`` + ``background_proc_alive`` event, not a crash.
-    for task_id, worker_pid in parked:
-        _bgproc.park_for_live_background(conn, task_id, stage="crashed", exclude_pid=worker_pid)
     return sweep
 
 
@@ -1644,16 +1716,11 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
-    park_live_proc: bool = False,
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
     Called per ready/review row before any claim attempt. Priority order:
-    ``"live_background_proc"`` (t_639b6d1d: a process this card's previous run
-    left behind is still alive, so the card is parked ``blocked (transient)``
-    here and no twin worker starts — only when the caller passes
-    ``park_live_proc``, because the read-only review-capacity probe must never
-    write), ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
+    ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
     refused — no restart-safe scope — within the cooldown; never counted),
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
@@ -1668,8 +1735,6 @@ def check_respawn_guard(
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
     """
-    if park_live_proc and _bgproc.park_for_live_background(conn, task_id, stage="spawn"):
-        return "live_background_proc"
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
         (task_id,),
@@ -2017,6 +2082,14 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
         return 0
 
 
+# Written by :func:`count_running_tasks_other_boards` on every call: True when
+# env pins (``HERMES_KANBAN_DB``) folded every board slug into one file, which
+# makes the returned count structurally under-count to 0. Read by
+# :func:`_tick_spawn_budget` to warn that a capacity decision taken from a
+# pinned process is not host-accurate (t_8038a077).
+_other_boards_pin_shadowed = False
+
+
 def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     """Total ``running`` tasks across every board EXCEPT ``board``.
 
@@ -2024,22 +2097,44 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     this a derived cap of N gets multiplied by the number of active boards.
     Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
     board to one file) yields 0. Fails open per board.
+
+    Diagnostic trap (t_8038a077): under that pin every slug resolves to the
+    SAME file, so the dedupe skips the whole board set and this returns 0 while
+    the gateway — which runs unpinned — really does count the other boards.
+    A dispatch probe or dry-run launched from a pinned/fenced worker
+    environment (``HERMES_KANBAN_DB`` injected by the dispatcher) therefore
+    *over*-reports the remaining budget and contradicts live behaviour.
+    ``_other_boards_pin_shadowed`` records when that collapse happened, and
+    dispatch probes belong in an unpinned shell
+    (``env -u HERMES_KANBAN_DB -u HERMES_KANBAN_BOARD``) for numbers that match
+    the gateway.
     """
+    global _other_boards_pin_shadowed
+    _other_boards_pin_shadowed = False
     try:
         current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
     except Exception:
         current_path = None
     try:
+        current_slug = board or _kb.get_current_board()
+    except Exception:
+        current_slug = board
+    try:
         boards = _kb.list_boards(include_archived=False)
     except Exception:
         return 0
     total = 0
+    shadowed = False
     for meta in boards:
         slug = meta.get("slug") or _kb.DEFAULT_BOARD
         try:
             path = _kb.kanban_db_path(board=slug).expanduser()
             resolved = str(path.resolve())
             if current_path is not None and resolved == current_path:
+                if slug != current_slug:
+                    # A DIFFERENT board folded into this file — only the env
+                    # pins do that. Its workers are now invisible to the count.
+                    shadowed = True
                 continue
             if not path.exists():
                 continue
@@ -2051,6 +2146,7 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
                     other.close()
         except Exception:
             continue
+    _other_boards_pin_shadowed = shadowed
     return total
 
 
@@ -2193,7 +2289,7 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
-    guard_reason = check_respawn_guard(conn, task_id, lane=lane, park_live_proc=not dry_run)
+    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
@@ -2376,6 +2472,34 @@ def _run_reclaim_phase(
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
+# One warning per process: the shadowed count is a property of the environment,
+# not of the tick — repeating it every 30 s would bury the signal.
+_pin_shadow_warned = False
+
+
+def _warn_pin_shadowed_count_once() -> None:
+    """Say out loud that cross-board capacity accounting is blind right now.
+
+    A ``HERMES_KANBAN_DB``-pinned process (a dispatched worker's shell, a
+    delegated child, a probe run inside one) resolves every board to one file,
+    so :func:`count_running_tasks_other_boards` returns 0 and the remaining
+    budget looks larger than the host's. The gateway itself is unpinned; this
+    only fires where the numbers can lie — exactly the diagnostic trap that
+    turned the t_886b92d9 stall investigation into a 25-minute hunt.
+    """
+    global _pin_shadow_warned
+    if _pin_shadow_warned:
+        return
+    _pin_shadow_warned = True
+    _kb._log.warning(
+        "kanban dispatch: HERMES_KANBAN_DB pins every board to one file in this "
+        "process, so cross-board capacity accounting sees 0 other boards and "
+        "over-reports the remaining budget. Capacity decisions taken here are "
+        "not host-accurate — probe from an unpinned shell "
+        "(env -u HERMES_KANBAN_DB -u HERMES_KANBAN_BOARD)."
+    )
+
+
 def _tick_spawn_budget(
     conn: sqlite3.Connection,
     result: DispatchResult,
@@ -2391,6 +2515,11 @@ def _tick_spawn_budget(
     by N every tick. ``max_in_progress`` is a HOST-level cap: running workers on
     every other board count against the same budget, else N boards multiply the
     cap by N — exactly the fan-out the memory-derived default exists to prevent.
+
+    A whole-tick refusal is never silent any more: it fills
+    ``result.held_back_max_spawn`` / ``result.held_back_capacity`` with
+    ``(used, limit)``, which is what :func:`describe_suppression` turns into
+    ``capacity=8/8`` for the "dispatcher stuck" warning (t_8038a077).
     """
     # Count already-running tasks so max_spawn enforces concurrency, not a
     # per-tick budget: "running" tasks stay running until the worker makes a terminal
@@ -2403,12 +2532,20 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            # Record WHICH cap refused the tick — without this the refusal was
+            # invisible everywhere: no bucket, no task event, no suffix on the
+            # "dispatcher stuck" warning (t_8038a077).
+            result.held_back_max_spawn = (int(running_count), int(max_spawn))
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
-        total_running = running_count + count_running_tasks_other_boards(board)
+        other_running = count_running_tasks_other_boards(board)
+        if _other_boards_pin_shadowed:
+            _warn_pin_shadowed_count_once()
+        total_running = running_count + other_running
         if total_running >= max_in_progress:
+            result.held_back_capacity = (int(total_running), int(max_in_progress))
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -2493,6 +2630,51 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     return name
 
 
+def _record_held_back_events(
+    conn: sqlite3.Connection, result: DispatchResult, *, dry_run: bool,
+) -> None:
+    """One ``held_back_capacity`` event per waiting card per hold episode.
+
+    The concurrency caps refuse the WHOLE tick before any lane is read, so
+    without this the card that could not spawn carries no evidence of the wait:
+    the t_886b92d9 incident card sat 58 minutes with only ``created`` in its
+    events while the gateway logged three reason-less "dispatcher stuck"
+    warnings. With it, ``hermes kanban tail`` answers "why did this wait"
+    without a gateway.log hunt.
+
+    State-change-only, the same rule as ``skipped_nonspawnable`` above: a row
+    is written only when the card's LAST event is not this same hold (same cap,
+    same numbers), so a saturated host costs one INSERT per waiting card rather
+    than one per tick — and a fresh row lands again when the numbers move
+    (``7/8 -> 8/8``) or anything else touched the card. Dry runs never write.
+    """
+    if dry_run:
+        return
+    if result.held_back_capacity is not None:
+        cap_name, used, limit = ("max_in_progress", *result.held_back_capacity)
+    elif result.held_back_max_spawn is not None:
+        cap_name, used, limit = ("max_spawn", *result.held_back_max_spawn)
+    else:
+        # Not a capacity hold (memory pressure / nothing withheld): no card to
+        # blame, and pressure already has its own result bucket + log line.
+        return
+    payload = {"cap": cap_name, "used": int(used), "limit": int(limit)}
+    encoded = _kb._json_or_null(payload)
+    rows = _lane_rows(conn, "ready")
+    if review_dispatch_enabled():
+        rows += _lane_rows(conn, "review")
+    if not rows:
+        return
+    with _kb.write_txn(conn):
+        for row in rows:
+            last = conn.execute(
+                "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT 1", (row["id"],)).fetchone()
+            if (last is None or last["kind"] != "held_back_capacity"
+                    or last["payload"] != encoded):
+                _kb._append_event(conn, row["id"], "held_back_capacity", payload)
+
+
 # The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
 # critical section (#56066 sweeper finding / #64231 disposition): a slow subscriber must never extend the
 # lock hold and stall a sibling dispatcher's tick.
@@ -2525,6 +2707,9 @@ def _dispatch_once_locked(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
     if not may_spawn:
+        # Whole-tick hold: leave the reason on the waiting cards, so a 58-minute
+        # silent queue is diagnosable from `tail` instead of a log hunt.
+        _record_held_back_events(conn, result, dry_run=dry_run)
         return result
 
     ready_rows = _lane_rows(conn, "ready")

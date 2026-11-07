@@ -179,7 +179,6 @@ def test_error_truncated_to_bounded_length(monkeypatch, tmp_path):
 def test_failure_type_classification(monkeypatch, tmp_path):
     inc = _point_db(monkeypatch, tmp_path)
     cases = [
-        ("delivery failed for telegram chat", "delivery"),
         ("Provider read timed out after 60s", "timeout"),
         ("authentication failed: invalid API key", "auth"),
         ("HTTP 429: rate limit exceeded", "rate_limit"),
@@ -190,6 +189,15 @@ def test_failure_type_classification(monkeypatch, tmp_path):
     ]
     for error, expected in cases:
         assert inc._classify_failure_type(error) == expected, (error, expected)
+
+    # Phase 3a (T2 §3.1): the ``delivery`` bucket is OUTCOME-driven. Error text that
+    # merely MENTIONS delivery (the measured T-2 probe mislabel: intentional failure
+    # whose stderr carried ``failure_deliver``) must NOT classify as ``delivery`` —
+    # and the same text does classify once the caller knows the send actually failed.
+    prose = "delivery failed for telegram chat"
+    assert inc._classify_failure_type(prose) != "delivery"
+    assert inc._classify_failure_type(prose, delivery_failed=True) == "delivery"
+    assert inc._classify_failure_type("failure_deliver bot-chat:triage exploded") != "delivery"
 
 
 # ── Lifecycle / ack ────────────────────────────────────────────────────────

@@ -223,9 +223,15 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
     # The process's async-delegation ledger belongs to the adopted execution, never a reserved child.
     binds_delegation_ledger = True
 
-    def __init__(self, rpc, scope, outbox_dir, adopted=None, *, max_bytes=4 * 1024 * 1024):
+    def __init__(self, rpc, scope, outbox_dir, adopted=None, *, max_bytes=32 * 1024 * 1024):
         self.rpc = rpc
         self.scope = dict(scope)
+        # 2026-11-07 (t_2abd10ab): the old 4 MB cap sat below what one legitimate journal entry
+        # needs on a long-lived unattended session — ``compression.archive`` carries the pruned
+        # handoff rows AND the full unpruned edges as ``held_for_cas`` (measured: a 4.28 MB
+        # transcript, kanban session local-94ac465e / run 1089). That save refused and its sticky
+        # ``outbox_full`` failure then killed the interpreter at the turn-final flush: hours of
+        # finished work were lost to a storage-capacity limit, not to the card's own task.
         self.max_bytes = max_bytes
         self.lock = threading.RLock()
         self.failure = None

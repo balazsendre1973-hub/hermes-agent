@@ -120,19 +120,31 @@ DEFAULT_WORKFLOW = Workflow(
         Column("running", "Running", "●", drag_target=False),
         Column("blocked", "Blocked", "⊘"),
         Column("review", "Review", "◎", drag_target=False),
+        # Ticket-flow veto (hiba-ticket spec §5): Fin's ``VÉTO: <indok>`` comment lands the
+        # card here from ANY live column; the rollback sends it back to ``triage`` for Fin's
+        # decision. Not a drag-first column in the desktop's sense, but a PATCH/drag target.
+        Column("revoked-by-Fin", "Revoked by Fin", "⛔"),
         Column("done", "Done", "✓"),
     ),
     manual=_frozen_manual({
-        "triage": ("todo", "ready"),
-        "todo": ("triage", "scheduled", "ready"),
-        "scheduled": ("triage", "todo", "ready"),
-        "ready": ("triage", "todo", "scheduled", "blocked", "review", "done"),
-        "running": ("triage", "todo", "scheduled", "ready", "blocked", "review", "done"),
-        "blocked": ("triage", "todo", "scheduled", "ready", "done"),
+        "triage": ("todo", "ready", "revoked-by-Fin"),
+        "todo": ("triage", "scheduled", "ready", "revoked-by-Fin"),
+        "scheduled": ("triage", "todo", "ready", "revoked-by-Fin"),
+        "ready": ("triage", "todo", "scheduled", "blocked", "review", "done", "revoked-by-Fin"),
+        "running": ("triage", "todo", "scheduled", "ready", "blocked", "review", "done",
+                    "revoked-by-Fin"),
+        "blocked": ("triage", "todo", "scheduled", "ready", "done", "revoked-by-Fin"),
         # Known quirk kept for zero behavior change: review -> todo lands in ``ready``
         # (reopen_review_task ignores the requested target). Phase 1 fixes it.
-        "review": ("triage", "todo", "ready", "done"),
-        "done": ("triage", "todo", "ready"),
+        "review": ("triage", "todo", "ready", "done", "revoked-by-Fin"),
+        "done": ("triage", "todo", "ready", "revoked-by-Fin"),
+        # Veto rollback: from ``revoked-by-Fin`` only the direct-write verbs land —
+        # ``triage`` (the spec's rollback target), ``todo``/``ready`` (Fin re-enters the
+        # flow directly). schedule/block/request_review/complete all gate their source
+        # status (``status IN (...)`` in kanban_db) and refuse this column, so they are
+        # NOT offered here; ``archived`` stays implicit (can_move) and the archived
+        # SOURCE may not be vetoed (plugin_api._revoke_task refuses it).
+        "revoked-by-Fin": ("triage", "todo", "ready"),
         ARCHIVED: ("triage", "todo", "ready"),  # restore from the archive filter
     }),
 )

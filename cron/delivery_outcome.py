@@ -14,6 +14,7 @@ idempotent and never rewrites a later run's status.
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Optional
 
@@ -72,6 +73,28 @@ def settled_outcome(execution_id: str) -> Optional[str]:
     return terminal[0] if terminal else None
 
 
+def _reclassify_failure_incident(execution_id: str, ledger_outcome: str) -> None:
+    """Phase 3a (T2 §3.1): the queued send's terminal ledger outcome is the last chance to
+    settle the run incident's ``delivery`` bucket — the drain path already handled the
+    in-memory case, this covers the fence/``unknown`` (owner died mid-send) recoveries.
+    The queue row's ``job_json`` carries ``_failure_incident_id``. Best-effort only."""
+    try:
+        from cron.delivery_queue import get_status
+        from cron.incidents import reclassify_incident_for_delivery
+
+        row = get_status(execution_id)
+        if not row or not row.get("job_json"):
+            return
+        incident_id = (json.loads(row["job_json"]) or {}).get("_failure_incident_id")
+        if incident_id:
+            reclassify_incident_for_delivery(
+                str(incident_id), delivery_failed=(ledger_outcome == "failed"))
+    except Exception:
+        logger.warning(
+            "Cron delivery %s: incident delivery reclassification skipped",
+            execution_id, exc_info=True)
+
+
 def settle_queued_delivery(job_id: Optional[str], execution_id: Optional[str]) -> bool:
     """Apply the queue's terminal outcome for *execution_id*; False while still in flight."""
     if not job_id or not execution_id:
@@ -83,6 +106,7 @@ def settle_queued_delivery(job_id: Optional[str], execution_id: Optional[str]) -
 
     settle_delivery_outcome(str(execution_id), terminal[0])
     _settle_job_record(str(job_id), str(execution_id), terminal[1])
+    _reclassify_failure_incident(str(execution_id), terminal[0])
     return True
 
 

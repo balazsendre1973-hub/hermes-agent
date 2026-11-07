@@ -1372,6 +1372,17 @@ def drain_delivery_queue(adapters, loop) -> int:
         if (not error and queued_for_failure
                 and not queued_job.get("_notification_all_targets_suppressed")):
             _mark_incident_alerted(queued_job.get("_failure_incident_id"))
+        # Phase 3a (T2 §3.1): the queued send's real outcome decides the incident's
+        # ``delivery`` bucket (the queue row carries the id; settle repeats this
+        # idempotently for the fence/unknown paths). Best-effort by contract.
+        incident_id = queued_job.get("_failure_incident_id")
+        if incident_id and queued_for_failure:
+            try:
+                from cron.incidents import reclassify_incident_for_delivery
+                reclassify_incident_for_delivery(incident_id, delivery_failed=bool(error))
+            except Exception as exc:
+                logger.debug(
+                    "Incident delivery reclassification failed for %s: %s", incident_id, exc)
         return error
 
     return drain(send)
@@ -3195,6 +3206,17 @@ def _deliver_crash_failure(
         notification_suppressed=bool(job.get("_notification_all_targets_suppressed")))
     if delivery_outcome in ("delivered", "not_configured"):
         _mark_incident_alerted(failure_incident_id)
+    if failure_incident_id and delivery_outcome != "queued":
+        # Phase 3a (T2 §3.1): the ``delivery`` bucket follows this send's outcome, not the
+        # error text (see cron.incidents.reclassify_incident_for_delivery). Best-effort:
+        # a classification hiccup must never break the failure delivery itself.
+        try:
+            from cron.incidents import reclassify_incident_for_delivery
+            reclassify_incident_for_delivery(
+                failure_incident_id, delivery_failed=(delivery_outcome == "failed"))
+        except Exception as exc:
+            logger.debug(
+                "Incident delivery reclassification failed for %s: %s", failure_incident_id, exc)
     return delivery_error, delivery_outcome
 
 

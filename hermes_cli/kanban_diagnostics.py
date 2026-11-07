@@ -11,7 +11,7 @@ recovery action and auto-clears when the failure mode resolves.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Container, Iterable, Optional
 import json
 import time
 
@@ -107,9 +107,67 @@ def _first_field(task, primary: str, legacy: str, default=None):
     return v if v is not None else _task_field(task, legacy, default)
 
 
-def _latest_event_ts(events: Iterable[Any], kinds: set[str]) -> int:
+def _latest_event_ts(events: Iterable[Any], kinds: Container[str]) -> int:
     """Max ``created_at`` over events whose kind is in ``kinds`` (0 if none)."""
     return max([0, *(_event_ts(ev) for ev in events if _event_kind(ev) in kinds)])
+
+
+# --- canonical definition: what starts a claim-less ``ready`` stretch (t_85b1f2e1) ---
+# Every event kind that hands a card into a CLAIM-LESS ``ready`` state — the
+# moment a strand clock must start measuring from. Two families:
+#
+#   * ready-entry transitions: ``created``/``promoted``/``unblocked``/
+#     ``reclaimed`` plus ``status`` (manual move, the legacy event every
+#     drag-drop/``_set_status_direct`` write emits) and ``changes_requested``
+#     (review hand-back);
+#   * claim-loss requeue paths: ``crashed``/``rate_limited``/
+#     ``protocol_violation``/``timed_out``/``stale``/``reconciled``/
+#     ``spawn_failed`` — each flips ``running`` to the retry status WITHOUT a
+#     ready-entry event of its own — plus ``worker_lost``, which the gateway
+#     records while the card is still ``running``.
+#
+# The second family is the fix for the 2026-11-06 16:14 phantom ELAKADT cards:
+# a gateway restart (worker_lost 16:12:43, crash-requeue 16:14:22) left
+# ``_ready_since``/``last_ready_ts`` falling back to ``promoted`` (15:07), so a
+# 99-second claim gap measured as 66 minutes and three cards were flagged as
+# stranded while their workers were alive.
+#
+# Deliberately EXCLUDES in-run/annotation kinds (``heartbeat``, ``claimed``,
+# ``spawned``, ``worker_bound``, ``respawn_guarded``, ``commented``): those
+# fire *inside* a stretch, and counting them would reset the clock on every
+# retry attempt and mask a real strand.
+#
+# Mirrored verbatim in ~/.hermes/profiles/logchan/scripts/task_register_sync.py
+# (``_ready_since``) — that script runs on the logchan profile's interpreter and
+# cannot import this module, so tests/test_kanban_diagnostics.py asserts the two
+# lists stay identical.
+READY_TRANSITION_KINDS = frozenset({
+    "created", "promoted", "unblocked", "reclaimed", "status", "changes_requested",
+    "crashed", "rate_limited", "protocol_violation", "timed_out", "stale",
+    "reconciled", "spawn_failed", "worker_lost",
+})
+
+
+def _latest_run_end_ts(runs: Iterable[Any]) -> int:
+    """Max ``ended_at`` over runs that have closed (0 if none).
+
+    Floor of the current ready stretch: a card cannot have been waiting since
+    before the run that just lost its claim. It backstops any requeue kind the
+    list above has not enumerated yet, so the ``created_at`` fallback can never
+    resurrect an ancient timestamp for a card that has since been worked on.
+    Unparseable/absent ``ended_at`` (old rows, dict fixtures) contributes 0.
+    """
+    if not runs:
+        return 0
+    ended: list[int] = []
+    for run in runs:
+        try:
+            ts = int(_task_field(run, "ended_at", 0) or 0)
+        except (TypeError, ValueError):
+            ts = 0
+        if ts:
+            ended.append(ts)
+    return max(ended, default=0)
 
 
 def _latest_gave_up_is_terminal_provider(events: Iterable[Any]) -> bool:
@@ -695,10 +753,18 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     if not assignee.strip():
         return []
 
-    # Most recent event that put the task into ready; with none (old task /
-    # truncated events) fall back to created_at — over-flagging an ancient
-    # task beats missing a stranded one.
-    last_ready_ts = _latest_event_ts(events, {"created", "promoted", "reclaimed", "unblocked"})
+    # Start of the CURRENT claim-less ready stretch: the most recent event that
+    # put the task into ready (the full READY_TRANSITION_KINDS list — including
+    # the crash/requeue kinds, which are exactly the paths that hand a `running`
+    # card back without emitting a ready-entry event), floored by the last run
+    # that ended, so an unenumerated future requeue kind cannot resurrect the
+    # promoted/created timestamp. With neither (old task / truncated events)
+    # fall back to created_at — over-flagging an ancient task beats missing a
+    # stranded one.
+    last_ready_ts = max(
+        _latest_event_ts(events, READY_TRANSITION_KINDS),
+        _latest_run_end_ts(runs),
+    )
     if last_ready_ts == 0:
         last_ready_ts = int(_task_field(task, "created_at", default=0) or 0)
     if last_ready_ts == 0:

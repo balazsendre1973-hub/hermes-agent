@@ -232,3 +232,50 @@ class TestPurgeProfileState:
         states = {row["obligation_id"]: row["state"] for row in db._read_all(
             "SELECT obligation_id, state FROM delivery_obligations")}
         assert states == {"ob_gone": "abandoned", "ob_keep": "pending"}
+
+    def test_purges_local_receipts_of_the_purged_profile_home_only(self, db, monkeypatch):
+        """The delete side of a LOCAL creation receipt: its ``profile_id`` is the creating
+        profile's home, so purging a profile takes exactly its ``state_meta`` receipts with it —
+        another profile's receipt in the same shared store (receipts of several profiles live in
+        one store, which is what makes this a question at all), a non-LOCAL key under the same
+        home and a malformed receipt are not identity of the deleted profile and stay."""
+        monkeypatch.setenv("HERMES_HOME", str(db.db_path.parent))
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_state_local import POLICY_PREFIX
+        from hermes_state_mutation_retirement import RETIRED_PREFIX
+
+        gone_home = str(db.db_path.parent / "profiles" / "gone")
+        keep_home = str(db.db_path.parent / "profiles" / "keepme")
+        # The name -> home mapping the purge resolves is the one receipts were written with.
+        assert str(get_profile_dir("gone")) == gone_home
+        assert str(get_profile_dir("keepme")) == keep_home
+        receipts = {
+            # Two receipts of the purged home; one spelled with a trailing separator, as a launch
+            # process may have spelled HERMES_HOME — same home, both go.
+            "sess_gone": {"profile_id": gone_home, "session_id": "sess_gone",
+                          "route": "agent:gone:feishu:dm:chatA"},
+            "sess_gone2": {"profile_id": gone_home + "/", "session_id": "sess_gone2",
+                           "route": "agent:gone:feishu:dm:chatB"},
+            "sess_keep": {"profile_id": keep_home, "session_id": "sess_keep",
+                          "route": "agent:keepme:feishu:dm:chatC"},
+        }
+        for session_id, receipt in receipts.items():
+            db._write_sql(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                (POLICY_PREFIX + session_id, json.dumps(receipt)))
+        # A non-LOCAL key under the same home is settled by its session id, never by this purge.
+        db._write_sql(
+            "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+            (RETIRED_PREFIX + "sess_gone", gone_home))
+        # Malformed LOCAL value: matches no home, so it stays instead of guessing.
+        db._write_sql(
+            "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+            (POLICY_PREFIX + "sess_broken", "not json"))
+
+        counts = db.purge_profile_state("gone")
+
+        assert counts["state_meta"] == 2
+        keys = {row["key"] for row in db._read_all("SELECT key FROM state_meta")}
+        assert not keys & {POLICY_PREFIX + "sess_gone", POLICY_PREFIX + "sess_gone2"}
+        assert {POLICY_PREFIX + "sess_keep", POLICY_PREFIX + "sess_broken",
+                RETIRED_PREFIX + "sess_gone"} <= keys

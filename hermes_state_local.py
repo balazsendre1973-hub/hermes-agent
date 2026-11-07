@@ -3,6 +3,7 @@ import json
 import threading
 import time
 from collections import OrderedDict
+from pathlib import Path
 
 from hermes_state_runtime import RuntimeStoreError, _epoch, _json
 
@@ -167,6 +168,52 @@ def retire_local_receipts(conn, session_ids):
                                                 (API_DECLARED_PREFIX + '*',)) if value in targets]
     gone += [API_BINDING_PREFIX + sid for sid in targets]
     conn.executemany('DELETE FROM state_meta WHERE key=?', [(key,) for key in gone])
+
+
+def _normalize_home(value):
+    """A profile home compared as a resolved path: receipts store ``str(home)`` as the launching
+    process spelled it, so a trailing separator, a ``.``/``..`` segment or a symlink spelling on
+    either side must not strand a receipt that names that home."""
+    try:
+        return str(Path(str(value)).expanduser().resolve())
+    except (OSError, RuntimeError, ValueError):
+        return str(value)
+
+
+def _receipt_profile_home(value):
+    """Normalized ``receipt.profile_id`` of *value* — the absolute HERMES_HOME that created it —
+    or None for a receipt that carries no home (malformed JSON, non-object, empty id), which is
+    then never a match rather than a match for whatever it might have meant."""
+    try:
+        payload = json.loads(value)
+        profile_id = payload.get('profile_id') if isinstance(payload, dict) else None
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(profile_id, str) or not profile_id.strip():
+        return None
+    return _normalize_home(profile_id)
+
+
+def purge_local_receipts(conn, home):
+    """Deletion-side sibling of :func:`retire_local_receipts` for a deleted profile: drop every
+    LOCAL creation receipt (``gateway.local_policy.v1:<session_id>``) whose ``profile_id`` names
+    *home*. A creation receipt is identity of the profile that made it — the launch request and
+    route of a profile whose directory is gone — so it is purged with the name, exactly like the
+    ``agent:<name>:`` routing keys; another profile's receipt in the same shared store is not
+    identity of the deleted profile and stays.
+
+    Only LOCAL receipts are read: an API binding or a declared conversation key carries no home
+    and goes with its session id (:func:`retire_local_receipts`), never with this profile purge. A
+    malformed receipt matches nothing, so it cannot take a bystander with it. Returns the number
+    of receipts deleted."""
+    target = _normalize_home(home) if home is not None else None
+    if not target:
+        return 0
+    gone = [key for key, value in conn.execute('SELECT key,value FROM state_meta WHERE key GLOB ?',
+                                               (POLICY_PREFIX + '*',))
+            if _receipt_profile_home(value) == target]
+    conn.executemany('DELETE FROM state_meta WHERE key=?', [(key,) for key in gone])
+    return len(gone)
 
 
 def moved_receipts(conn, target_ids=None):

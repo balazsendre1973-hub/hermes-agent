@@ -588,6 +588,21 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
     return _set_status_direct(conn, task_id, s)
 
 
+def _revoke_task(conn, task_id: str, p) -> bool:
+    """Fin veto: land the card in ``revoked-by-Fin`` from ANY live column.
+
+    Deliberately a direct write, not ``_drag_to``: a veto must not be re-routed through
+    ``reopen_review_task`` (review source) or the ready-parent gate — Fin's ``VÉTO:``
+    comment overrides the current column outright, worker included (``_set_status_direct``
+    ends a running claim the same way a drag out of ``running`` does). ``archived`` stays
+    archived: restore first, veto second — the rollback target is ``triage`` anyway.
+    """
+    current = kanban_db.get_task(conn, task_id)
+    if current is None or current.status == kanban_workflow.ARCHIVED:
+        return False
+    return _set_status_direct(conn, task_id, "revoked-by-Fin")
+
+
 # Status verb dispatch shared by PATCH /tasks/{id} and POST /tasks/bulk: (conn, task_id,
 # payload) -> ok. ``review`` uses request_review (never a block, so it can't trip unblock-loop
 # detection) and ``done`` pass ``force=True``: a dashboard action is a human override of a live worker claim.
@@ -600,7 +615,8 @@ _STATUS_HANDLERS: dict[str, Any] = {
         conn, tid, summary=p.summary, metadata=p.metadata, reviewer=(p.assignee or None), force=True),
     "ready": lambda conn, tid, p: _drag_to(conn, tid, "ready"),
     "todo": lambda conn, tid, p: _drag_to(conn, tid, "todo"),
-    "triage": lambda conn, tid, p: _drag_to(conn, tid, "triage")}
+    "triage": lambda conn, tid, p: _drag_to(conn, tid, "triage"),
+    "revoked-by-Fin": _revoke_task}
 
 
 def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str) -> bool:

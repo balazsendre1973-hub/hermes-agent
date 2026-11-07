@@ -390,6 +390,22 @@ class TestJobCRUD:
         assert remove_job(job["id"]) is True
         assert get_job(job["id"]) is None
 
+    def test_remove_job_closes_its_open_incidents(self, tmp_cron_dir, monkeypatch, tmp_path):
+        """Phase 3b (T2 §3.2): deleting a job closes its OPEN incidents in the same
+        operation. A removed job can never run green again, so the recovery hook can
+        never resolve them — without this they sit as "open" in ``hermes cron
+        incidents`` forever. Other jobs' incidents stay untouched."""
+        from cron import incidents
+        monkeypatch.setattr(incidents, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
+        job = create_job(prompt="Temp job", schedule="30m")
+        open_id, _ = incidents.upsert_incident(job["id"], "boom happened")
+        other_id, _ = incidents.upsert_incident("other-job", "boom happened")
+
+        assert remove_job(job["id"]) is True
+        assert incidents.get_incident(open_id)["state"] == "closed"
+        assert incidents.get_incident(open_id)["acked_at"]
+        assert incidents.get_incident(other_id)["state"] == "detected"
+
 
     def test_auto_repeat_for_once(self, tmp_cron_dir):
         job = create_job(prompt="One-shot", schedule="in 1h")
