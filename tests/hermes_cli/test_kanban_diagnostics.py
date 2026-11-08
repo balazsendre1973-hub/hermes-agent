@@ -195,6 +195,85 @@ def test_stranded_in_ready_fires_when_age_exceeds_threshold():
     assert stranded[0].data["assignee"] == "demo"
 
 
+def test_stranded_in_ready_starts_at_the_crash_requeue_not_the_promotion():
+    """A crash-requeue hands a `running` card back to `ready` WITHOUT a
+    ready-entry event, so the strand clock must start there — not at
+    ``promoted``. Regression for the 2026-11-06 16:14 phantom cards: a gateway
+    restart (``worker_lost`` 16:12:43, ``crashed`` 16:14:22) left the clock on
+    ``promoted`` (15:07), measuring a 99-second claim gap as 66 minutes."""
+    now = 100_000
+    task = _task(status="ready", assignee="coder", claim_lock=None)
+    events = [
+        _event("created", ts=now - 66 * 60),
+        _event("promoted", ts=now - 65 * 60),
+        _event("claimed", ts=now - 64 * 60),
+        _event("worker_lost", ts=now - 110),
+        _event("crashed", ts=now - 99),
+    ]
+    runs = [_run(outcome="crashed")]
+    assert kd.compute_task_diagnostics(task, events, runs, now=now) == []
+
+    # The same list minus the claim-loss kinds is the pre-fix behaviour: it
+    # must flag, so this test cannot pass vacuously.
+    legacy = [ev for ev in events if ev["kind"] not in {"crashed", "worker_lost"}]
+    stranded = [d for d in kd.compute_task_diagnostics(task, legacy, [], now=now)
+                if d.kind == "stranded_in_ready"]
+    assert len(stranded) == 1 and stranded[0].data["age_seconds"] >= 65 * 60
+
+
+def test_stranded_in_ready_still_fires_when_a_crashed_card_sits_ready():
+    """The new kinds only move the clock FORWARD: a card that crashed 45 min
+    ago and has been claim-less since is exactly what the rule is for."""
+    now = 100_000
+    task = _task(status="ready", assignee="demo", claim_lock=None)
+    events = [
+        _event("created", ts=now - 5 * 3600),
+        _event("claimed", ts=now - 4 * 3600),
+        _event("crashed", ts=now - 45 * 60),
+        _event("respawn_guarded", ts=now - 40 * 60),  # in-run noise: no reset
+    ]
+    runs = [_run(outcome="crashed")]
+    stranded = [d for d in kd.compute_task_diagnostics(task, events, runs, now=now)
+                if d.kind == "stranded_in_ready"]
+    assert len(stranded) == 1
+    assert stranded[0].data["age_seconds"] == 45 * 60
+
+
+def test_run_end_floors_a_requeue_kind_nobody_enumerated_yet():
+    """Belt and braces: a run that closed 10 min ago proves the card was worked
+    on, so no unenumerated future requeue kind can resurrect ``created`` and
+    manufacture a strand out of a 5-hour-old timestamp."""
+    now = 100_000
+    task = _task(status="ready", assignee="demo", claim_lock=None,
+                 created_at=now - 5 * 3600)
+    events = [_event("created", ts=now - 5 * 3600),
+              _event("some_future_requeue_kind", ts=now - 10 * 60)]
+    runs = [{"id": 7, "outcome": "whatever", "ended_at": now - 10 * 60}]
+    assert kd.compute_task_diagnostics(task, events, runs, now=now) == []
+    # No closed run and no known ready-entry event: the created_at fallback
+    # still over-flags rather than staying silent.
+    stranded = [d for d in kd.compute_task_diagnostics(task, events, [], now=now)
+                if d.kind == "stranded_in_ready"]
+    assert len(stranded) == 1
+
+
+REGISTER_SYNC = Path.home() / ".hermes" / "profiles" / "logchan" / "scripts" / "task_register_sync.py"
+
+
+@pytest.mark.skipif(not REGISTER_SYNC.is_file(),
+                    reason="register mirror lives in the logchan profile")
+def test_register_mirror_shares_the_canonical_ready_transition_kinds():
+    """The register cannot import hermes_cli (it runs on the profile's own
+    interpreter), so it copies the list — this locks the copy to the source
+    (t_85b1f2e1: an uncoordinated half-fix would leave one side counting a
+    crash-requeue and the other not)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_kanban_register_under_test", REGISTER_SYNC)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert set(mod.READY_TRANSITION_KINDS) == set(kd.READY_TRANSITION_KINDS)
 
 
 # ---------------------------------------------------------------------------

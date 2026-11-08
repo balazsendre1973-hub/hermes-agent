@@ -2192,7 +2192,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs, _current_max_iterations, _resolve_runtime_agent_kwargs,
-            _resolve_gateway_model, _load_gateway_config, GatewayRunner)
+            _resolve_gateway_model, _load_gateway_config, GatewayRunner, ModelResolutionError)
         from hermes_cli.tools_config import _get_platform_tools
         # RuntimeError is caught ONLY here (sole provider-auth raiser); the typed subclass keeps
         # run_conversation() errors distinct.
@@ -2202,7 +2202,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             raise _ProviderAuthResolutionError(str(exc)) from exc
         # A fallback-provider runtime carries its own ``model``: pop it (overrides config, and
         # must not collide with the ``**runtime_kwargs`` spread).
-        model = runtime_kwargs.pop("model", None) or _resolve_gateway_model()
+        try:
+            model = runtime_kwargs.pop("model", None) or _resolve_gateway_model()
+        except ModelResolutionError:
+            model = None
         runtime_kwargs.pop("_fallback_notice", None)  # raw API surface: the switch is already logged
         request_reasoning_config = _request_reasoning_config(model_options)
         request_service_tier = _request_service_tier(model_options)
@@ -2291,9 +2294,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # Served BY the gateway process, so gateway_running is True by definition; busy/
         # drainable use the same shared contract as /api/status so the two never disagree.
         active_api_runs, process_depth, active_delegations = self._readiness_work_counts()
-        from gateway.run import _resolve_gateway_model
+        from gateway.run import ModelResolutionError, _resolve_gateway_model
+        try:
+            configured_model = _resolve_gateway_model()
+        except ModelResolutionError:
+            configured_model = None
+            logger.debug("gateway model unavailable for /api/status readiness")
         readiness = collect_runtime_readiness(
-            configured_model=_resolve_gateway_model(), runtime_status=runtime,
+            configured_model=configured_model, runtime_status=runtime,
             active_api_runs=active_api_runs, process_completion_queue_depth=process_depth,
             active_delegations=active_delegations)
         return web.json_response({

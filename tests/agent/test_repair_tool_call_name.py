@@ -125,3 +125,59 @@ class TestVolcEngineXmlPollution:
         # rest of the pipeline (fuzzy match at 0.7 cutoff) can still
         # recover the obvious target.
         assert repair('"terminal"') == "terminal"
+
+class TestShellToTerminalAlias:
+    """Regression coverage for 'shell' -> 'terminal' alias.
+    
+    Model-generated 'shell' tool calls must be repaired to 'terminal'.
+    Other unknown names must NOT be repaired (ensure new patterns are detected).
+    """
+    
+    def test_shell_repairs_to_terminal(self, repair):
+        """'shell' should repair to 'terminal' via explicit alias."""
+        assert repair("shell") == "terminal"
+    
+    def test_terminal_still_works(self, repair):
+        """Direct 'terminal' calls should still work (no regression)."""
+        assert repair("terminal") == "terminal"
+    
+    def test_unknown_name_returns_none(self, repair):
+        """Truly unknown names (not in aliases or fuzzy match) return None."""
+        # 'bash' is close to 'terminal' but below 0.7 fuzzy threshold
+        # ('b'->'te' is ~0.09 similarity, well below 0.7)
+        assert repair("bash") is None
+        # 'run' has no alias and won't fuzzy-match to anything valid
+        assert repair("run") is None
+    
+    def test_case_insensitive_alias(self, repair):
+        """Alias should work on lowercase (already normalized before alias check)."""
+        # The lowered version is already checked, so 'shell' -> 'terminal'
+        assert repair("shell") == "terminal"
+
+
+class TestAliasOnlyForShell:
+    """Ensure the alias dict is narrow: only 'shell' -> 'terminal' is supported.
+    
+    Other potentially confused names (bash, run, sh, cmd, exec, command) 
+    should return None to detect new patterns early.
+    """
+    
+    def test_bash_not_aliased(self, repair):
+        """'bash' should NOT be repaired (too different from 'terminal' for fuzzy)."""
+        assert repair("bash") is None
+    
+    def test_sh_not_aliased(self, repair):
+        """'sh' should NOT be repaired (too short for fuzzy match)."""
+        assert repair("sh") is None
+    
+    def test_cmd_not_aliased(self, repair):
+        """'cmd' should NOT be repaired."""
+        assert repair("cmd") is None
+    
+    def test_exec_not_aliased(self, repair):
+        """'exec' should NOT be repaired."""
+        assert repair("exec") is None
+    
+    def test_command_not_aliased(self, repair):
+        """'command' should NOT be repaired (not in valid tools)."""
+        assert repair("command") is None

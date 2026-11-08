@@ -451,8 +451,7 @@ class GatewayProfileReconcileMixin:
         claimed = self._primary_resource_claims(active)
         for profile_name, adapters in (getattr(self, "_profile_adapters", None) or {}).items():
             for platform, adapter in list(adapters.items()):
-                for claim in (self._adapter_credential_claim(platform, adapter),
-                              self._adapter_listener_claim(platform, adapter)):
+                for claim in self._adapter_claims(platform, adapter):
                     if claim is not None:
                         claimed[claim] = profile_name
         return claimed
@@ -493,14 +492,33 @@ class GatewayProfileReconcileMixin:
         retired = getattr(self, 'session_authorities', None) is None or await unserve_profile_runtime(self, home)
         pending = (getattr(self, "_profile_failed_platforms", None) or {}).pop(name, None) or {}
         tasks = [t for t in pending.values() if isinstance(t, asyncio.Task) and not t.done()]
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.wait(tasks, timeout=self._adapter_disconnect_timeout_secs())
+        # Its adapters stay in the map (live owners of their bots) while the reconnects cancel; the retiring
+        # mark keeps anything finishing meanwhile (a fatal teardown, a startup handoff) from queuing another.
+        retiring = getattr(self, "_retiring_profiles", None)
+        if retiring is None:
+            retiring = self._retiring_profiles = set()
+        retiring.add(name)
+        try:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.wait(tasks, timeout=self._adapter_disconnect_timeout_secs())
+        finally:
+            retiring.discard(name)
         with _profile_runtime_scope(Path(home), hydrate_secrets=False):
             adapters = (getattr(self, "_profile_adapters", None) or {}).pop(name, None) or {}
-            for platform, adapter in list(adapters.items()):
-                await self._bounded_adapter_teardown(adapter, platform, profile=name)
+            for platform, adapter in adapters.items():  # no await since the pop: each holds its bot until torn down
+                self._hold_secondary_claims(name, platform, adapter, self._adapter_claims(platform, adapter))
+            try:
+                for platform, adapter in list(adapters.items()):
+                    await self._bounded_adapter_teardown(adapter, platform, profile=name)
+                    self._release_secondary_claims(name, platform, adapter)  # its bot is free once it is down
+            finally:
+                # Every hold of the profile goes, a fatal teardown's still disconnecting included (the profile
+                # is gone, so its handler queues nothing): none may block a re-serve.
+                held = getattr(self, "_secondary_held_claims", None) or {}
+                for key in [key for key in held if key[0] == name]:
+                    del held[key]
             # Its ``<name>:<platform>`` runtime entries describe a profile that no longer exists.
             _write_runtime_status_quiet(drop_profile_platforms=name)
             for attr in ("pairing_stores", "_busy_text_modes_by_profile", "_busy_input_modes_by_profile",
@@ -726,7 +744,15 @@ def purge_profile_identity_verb(runner):
     alive elsewhere in the identity story — a rename's old name leaves the served set exactly like a
     delete does (its directory is gone either way) — and purging there would race the rekey it is
     supposed to leave intact. Only the delete path invokes this verb. Runs on the control-socket
-    executor thread; ``purge_profile_routing`` takes the store lock."""
+    executor thread; ``purge_profile_routing`` takes the store lock.
+
+    The durable side of the same settlement (``hermes_cli.profile_identity._purge_profile_identity``
+    with no live mux) purges the root store, the profile's own home AND every ``profiles/*/state.db``:
+    a directory moved before the tombstone (rename writerchan -> logchan) keeps the dead name's rows
+    under a directory name that no longer matches the purged profile. This verb must settle the same
+    stores — it runs in the process that owns them — or the moved store's rows survive the delete
+    under a live multiplexer exactly as the durable loop's two-store version used to.
+    """
 
     def _handler(params: dict) -> dict:
         name = str(params.get("name") or "").strip()
@@ -735,15 +761,61 @@ def purge_profile_identity_verb(runner):
         store = getattr(runner, "session_store", None)
         if store is None:
             return {"ok": False, "error": "live gateway has no session store"}
+        acquired = []
+        # Bound before the try: the import below rebinds this local, so a failed import must leave a
+        # None the finally can check — otherwise the finally itself would raise into the control socket.
+        release_or_close = None
         try:
             db_counts: dict[str, dict[str, int]] = {}
             routing_db = getattr(store, "_routing_db", None)
             if routing_db is not None and hasattr(routing_db, "purge_profile_state"):
                 db_counts["routing"] = routing_db.purge_profile_state(name)
+            # The routing index home is only the gateway's OWN root store (purged above): settle the
+            # sibling profile stores too, exactly like the durable path — matching happens inside
+            # purge_profile_state (by name/namespace, and by home path for receipts), so a store with
+            # nothing for this profile is a no-op. Tombstone stores under profiles/.deleted/ sit one
+            # level deeper than the glob and are never scanned: nothing loads them again.
+            failures: list[str] = []
+            routing_home = getattr(store, "_routing_home", None)
+            if routing_home is not None:
+                from hermes_state_registry import acquire, release_or_close
+
+                seen = {Path(routing_home) / "state.db"}  # the root store, already purged above
+                try:
+                    candidates = sorted((Path(routing_home) / "profiles").glob("*/state.db"))
+                except OSError as exc:  # unreadable profiles dir: no candidates, nothing to settle
+                    candidates = []
+                    logger.warning("Profile identity purge could not scan profile stores: %s", exc)
+                for db_path in candidates:
+                    if db_path in seen or not db_path.is_file():
+                        continue
+                    seen.add(db_path)
+                    try:
+                        db = acquire(db_path)
+                        acquired.append(db)
+                        db_counts[f"profile:{db_path.parent.name}"] = db.purge_profile_state(name)
+                    except Exception as exc:
+                        # One broken sibling store must not stop the rest of the scan; it still
+                        # settles as ok: False so the CLI reports the name as not settled and offers
+                        # the retry command instead of assuming success.
+                        failures.append(f"{db_path}: {type(exc).__name__}: {exc}")
+                        logger.warning("Profile identity purge failed for %r in %s: %s",
+                                       name, db_path, exc)
             dropped = store.purge_profile_routing(name)
+            if failures:
+                return {"ok": False, "error": "; ".join(failures), "dropped": dropped,
+                        "db": db_counts}
             return {"ok": True, "dropped": dropped, "db": db_counts}
         except Exception as exc:
             logger.warning("Profile identity purge failed for %r: %s", name, exc)
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            if release_or_close is not None:
+                for db in acquired:
+                    try:
+                        release_or_close(db)
+                    except Exception:
+                        logger.debug("Failed to release purged profile store handle",
+                                     exc_info=True)
 
     return _handler

@@ -1658,7 +1658,18 @@ def _forbid_real_user_path_writes(monkeypatch):
     monkeypatch.setattr("hermes_cli._install_repair._write_user_path_raw", refuse)
 
 
-@pytest.fixture(autouse=True)
+@ pytest.fixture(autouse=True)
+def _patch_activate_dependencies(monkeypatch):
+    """Patch pm.environments.activate_dependencies to no-op.
+
+    hermes_bootstrap.py calls activate_dependencies() at module level, which
+    tries to read manifest.json from the real hermes home. Tests that mock
+    run_agent.AIAgent don't need real dependency activation.
+    """
+    monkeypatch.setattr("pm.environments.activate_dependencies", lambda *a, **k: None)
+
+
+@ pytest.fixture(autouse=True)
 def _forbid_real_hermes_home_io(monkeypatch, request):
     """Guard Python file/metadata/deletion calls and SQLite against real state.
 

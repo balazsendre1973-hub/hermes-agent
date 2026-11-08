@@ -7,6 +7,7 @@ to the old name resolves to a profile that no longer exists and floods errors.lo
 identity-migration fix.
 """
 import json
+import sqlite3
 import time
 
 import pytest
@@ -225,3 +226,359 @@ class TestRekeyProfileState:
             "SELECT obligation_id, session_key FROM delivery_obligations")}
         assert keys == {"ob_gone": "agent:newname:feishu:dm:chatA",
                         "ob_keep": "agent:keepme:feishu:dm:chatB"}
+
+    def test_rekeys_transport_profile_alongside_profile_name(self, db):
+        # Owned session: profile_name and transport_profile both carry the old name.
+        db.create_session(
+            "sess_old", "telegram", session_key="agent:oldname:telegram:dm:chatA",
+            profile_name="oldname", chat_id="chatA", chat_type="dm",
+            transport_profile="oldname",
+        )
+        # Bystander profile keeps its own transport name untouched (exact-name match only).
+        db.create_session(
+            "sess_keep", "telegram", session_key="agent:keepme:telegram:dm:chatB",
+            profile_name="keepme", chat_id="chatB", chat_type="dm",
+            transport_profile="keepme",
+        )
+        # Same old profile_name, but NULL transport_profile: must stay NULL.
+        db.create_session(
+            "sess_null", "telegram", session_key="agent:oldname:telegram:dm:chatC",
+            profile_name="oldname", chat_id="chatC", chat_type="dm",
+        )
+
+        counts = db.rekey_profile_state("oldname", "newname")
+
+        assert counts["sessions_transport_profile"] == 1
+        assert counts["sessions_profile_name"] == 2
+        assert db._read_one(
+            "SELECT transport_profile FROM sessions WHERE id = ?", ("sess_old",)
+        )["transport_profile"] == "newname"
+        assert db._read_one(
+            "SELECT transport_profile FROM sessions WHERE id = ?", ("sess_keep",)
+        )["transport_profile"] == "keepme"
+        assert db._read_one(
+            "SELECT transport_profile FROM sessions WHERE id = ?", ("sess_null",)
+        )["transport_profile"] is None
+
+
+def _seed_local_session(db, *, home, name, sid, principal, request, task="t_rekey"):
+    """One committed-shape LOCAL session: creation receipt, session row, transcript, admission,
+    usage row, routing entry and a declared conversation key — what a real store carries for one
+    local chat. Returns ``(receipt, the exact bytes its frozen request was stored with)``."""
+    from hermes_state_local import API_DECLARED_PREFIX, POLICY_PREFIX
+
+    route = f"agent:{name}:local:dm:{sid}"
+    origin = {
+        "chat_id": sid, "chat_name": None, "chat_topic": None, "chat_type": "dm",
+        "platform": "local", "profile": name, "thread_id": None, "user_id": principal,
+        "user_name": None,
+    }
+    entry = {
+        "origin": origin, "session_key": route, "session_id": sid, "chat_type": "dm",
+        "platform": "local", "metadata": {}, "display_name": None, "suspended": False,
+    }
+    request_json = json.dumps({"cwd": "/work", "source": "kanban", "task_id": task}, sort_keys=True)
+    kanban_json = json.dumps(
+        {"board": "default", "claim_lock": "u:1", "db": "/x/kanban.db", "profile": name,
+         "run_id": 7, "task_id": task, "workspaces_root": "/x/workspaces"}, sort_keys=True)
+    receipt = {
+        "entry": entry,
+        "policy": {
+            "client_env_json": None, "client_env_remote": False, "client_env_rules_json": None,
+            "coding_posture": False,
+            "config_json": json.dumps({"model": {"default": "nvidia/x"}}, sort_keys=True),
+            "config_secret_ref": None, "credential_ref": None, "cwd": "/work",
+            "edit_approval_policy": "ask", "editor_mcp_json": None, "ignore_user_config": False,
+            "kanban_json": kanban_json, "model": "nvidia/x", "platform": "cli",
+            "request_json": request_json, "safe_mode": False, "skills_prompt": None,
+            "source": "kanban", "terminal_json": None, "toolsets": ["terminal"],
+        },
+        "principal_id": principal,
+        "profile_id": home,
+        "request_id": request,
+        "route": route,
+        "session_id": sid,
+    }
+    now = time.time()
+
+    def write(conn):
+        conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                     (POLICY_PREFIX + sid, json.dumps(receipt, ensure_ascii=False)))
+        conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                     (API_DECLARED_PREFIX + sid, sid))
+        conn.execute(
+            """INSERT INTO sessions (id, source, started_at, session_key, chat_id, chat_type,
+                                     user_id, profile_name, origin_json, message_count, cwd)
+               VALUES (?, 'cli', ?, ?, ?, 'dm', ?, ?, ?, 1, '/work')""",
+            (sid, now, route, sid, principal, name, json.dumps(origin, ensure_ascii=False)))
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', 'hi', ?)",
+            (sid, now))
+        conn.execute(
+            """INSERT INTO session_admissions (admission_id, request_id, principal_id,
+ target_session_id, lineage_json, payload_json, payload_digest, intent, status)
+               VALUES (?, ?, ?, ?, ?, ?, 'digest', 'queue', 'queued')""",
+            (f"adm-{name}", request, principal, sid, json.dumps([sid]),
+             json.dumps({"text": "hi"})))
+        conn.execute("INSERT INTO session_model_usage (session_id, model) VALUES (?, 'nvidia/x')",
+                     (sid,))
+        conn.execute(
+            "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
+            "VALUES ('', ?, ?, ?)",
+            (route, json.dumps(entry, ensure_ascii=False), now))
+    db._execute_write(write)
+    return receipt, request_json
+
+
+def _rows_mentioning(conn, needle):
+    """``table.column=rowcount`` for every cell of every table that still carries *needle*."""
+    hits = []
+    tables = [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    for table in tables:
+        for row in conn.execute(f"PRAGMA table_info('{table}')"):
+            column = row[1]
+            try:
+                count = conn.execute(
+                    f"SELECT count(*) FROM {table} WHERE CAST({column} AS TEXT) LIKE ?",
+                    (f"%{needle}%",)).fetchone()[0]
+            except sqlite3.Error:
+                continue
+            if count:
+                hits.append(f"{table}.{column}={count}")
+    return hits
+
+
+def test_local_receipt_rekeys_onto_the_new_profile_home(db, tmp_path, monkeypatch):
+    """A LOCAL receipt under the old profile_id is rebased onto the new home, its session id
+    re-derived from it, and every row that carried the old id follows — so the conversation the
+    receipt guards stays restorable instead of pointing at a session id nothing owns."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_state_keys import local_identity
+    from hermes_state_local import API_DECLARED_PREFIX, POLICY_PREFIX
+    from hermes_state_local_lineage import validate_local_lineage
+
+    old_home, new_home = tmp_path / "profiles" / "oldname", tmp_path / "profiles" / "newname"
+    principal, request = "uid:1000", 'kanban:["default","t_rekey",7]'
+    old_sid = local_identity(str(old_home), principal, request)
+    new_sid = local_identity(str(new_home), principal, request)
+    _seeded, request_json = _seed_local_session(
+        db, home=str(old_home), name="oldname", sid=old_sid, principal=principal, request=request)
+    # Another profile's receipt in the same shared store: not identity of this rename.
+    other_home = tmp_path / "profiles" / "othername"
+    other_sid = local_identity(str(other_home), principal, request)
+    other, _ = _seed_local_session(
+        db, home=str(other_home), name="othername", sid=other_sid, principal=principal,
+        request=request)
+
+    counts = db.rekey_profile_state("oldname", "newname")
+
+    assert counts["state_meta_receipts"] == 1
+    assert counts["sessions_id"] == 1 and counts["messages_session_id"] == 1
+    route = f"agent:newname:local:dm:{new_sid}"
+    with db._read_ctx() as conn:
+        keys = {row[0] for row in conn.execute(
+            "SELECT key FROM state_meta WHERE key GLOB ?", (POLICY_PREFIX + "*",))}
+        assert POLICY_PREFIX + old_sid not in keys
+        assert POLICY_PREFIX + new_sid in keys
+        rekeyed = json.loads(conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (POLICY_PREFIX + new_sid,)).fetchone()[0])
+
+        # The acceptance: a receipt under the old profile_id rekeyed to the new one, with its
+        # session id hash re-derived from exactly that new profile_id.
+        assert rekeyed["profile_id"] == str(new_home)
+        assert rekeyed["session_id"] == local_identity(
+            rekeyed["profile_id"], principal, request) == new_sid
+
+        # Its nested profile references moved with it: route, transcript key, local chat id,
+        # the profile name in the origin, and the profile inside the kanban policy blob.
+        assert rekeyed["route"] == route
+        assert rekeyed["entry"]["session_key"] == route
+        assert rekeyed["entry"]["session_id"] == new_sid
+        assert rekeyed["entry"]["origin"]["chat_id"] == new_sid
+        assert rekeyed["entry"]["origin"]["profile"] == "newname"
+        assert json.loads(rekeyed["policy"]["kanban_json"])["profile"] == "newname"
+        # ...while the frozen create request keeps its exact bytes: nothing in it is identity.
+        assert rekeyed["policy"]["request_json"] == request_json
+
+        # The conversation followed the id instead of being orphaned by it.
+        session = conn.execute(
+            "SELECT session_key, chat_id, profile_name FROM sessions WHERE id = ?",
+            (new_sid,)).fetchone()
+        assert session is not None
+        assert (session["session_key"], session["chat_id"], session["profile_name"]) == (
+            route, new_sid, "newname")
+        assert conn.execute(
+            "SELECT count(*) FROM sessions WHERE id = ?", (old_sid,)).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT count(*) FROM messages WHERE session_id = ?", (new_sid,)).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT target_session_id FROM session_admissions WHERE admission_id = ?",
+            ("adm-oldname",)).fetchone()[0] == new_sid
+        assert conn.execute(
+            "SELECT lineage_json FROM session_admissions WHERE admission_id = ?",
+            ("adm-oldname",)).fetchone()[0] == json.dumps([new_sid])
+        routing = conn.execute(
+            "SELECT session_key, json_extract(entry_json, '$.session_id'),"
+            " json_extract(entry_json, '$.origin.profile') FROM gateway_routing WHERE session_key = ?",
+            (route,)).fetchone()
+        assert routing is not None
+        assert (routing["session_key"], routing[1], routing[2]) == (route, new_sid, "newname")
+        assert conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (API_DECLARED_PREFIX + new_sid,),
+        ).fetchone()[0] == new_sid
+        assert API_DECLARED_PREFIX + old_sid not in {row[0] for row in conn.execute(
+            "SELECT key FROM state_meta")}
+
+        # The receipt still validates as this store's own, and nothing dangles.
+        validate_local_lineage(conn, rekeyed)
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert _rows_mentioning(conn, old_sid) == []
+
+        # The other profile's receipt and rows are byte-for-byte untouched.
+        assert conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (POLICY_PREFIX + other_sid,),
+        ).fetchone()[0] == json.dumps(other, ensure_ascii=False)
+        bystander = conn.execute(
+            "SELECT session_key, chat_id, profile_name FROM sessions WHERE id = ?",
+            (other_sid,)).fetchone()
+        assert (bystander["session_key"], bystander["chat_id"], bystander["profile_name"]) == (
+            f"agent:othername:local:dm:{other_sid}", other_sid, "othername")
+
+
+def test_legacy_receipt_rebases_its_home_without_moving_its_id(db, tmp_path, monkeypatch):
+    """A legacy receipt's id is its pre-unified id, not a hash of the home: only the profile_id
+    moves — in the receipt *and* in the binding row ``legacy_lineage_root`` compares it against,
+    or the re-based receipt would refuse to restore."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_state_local import POLICY_PREFIX
+    from hermes_state_local_lineage import validate_local_lineage
+    from hermes_state_local_migration import LEGACY_PREFIX
+
+    old_home, new_home = tmp_path / "profiles" / "oldname", tmp_path / "profiles" / "newname"
+    legacy_sid = "cron_oldjob_20261106_120000"
+    principal, request = "uid:1000", "cron:oldjob:execution"
+    route = f"agent:oldname:local:dm:{legacy_sid}"
+    origin = {"chat_id": legacy_sid, "chat_type": "dm", "platform": "local", "profile": "oldname",
+              "user_id": principal}
+    receipt = {
+        "entry": {"origin": origin, "session_key": route, "session_id": legacy_sid},
+        "legacy_session_id": legacy_sid,
+        "policy": {"request_json": json.dumps({"source": "cron"}, sort_keys=True)},
+        "principal_id": principal,
+        "profile_id": str(old_home),
+        "request_id": request,
+        "route": route,
+        "session_id": legacy_sid,
+    }
+
+    def seed(conn):
+        conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                     (POLICY_PREFIX + legacy_sid, json.dumps(receipt, ensure_ascii=False)))
+        conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                     (LEGACY_PREFIX + legacy_sid, json.dumps(
+                         {"session_id": legacy_sid, "profile_id": str(old_home),
+                          "principal_id": principal, "legacy_session_id": legacy_sid},
+                         ensure_ascii=False)))
+        conn.execute(
+            """INSERT INTO sessions (id, source, started_at, session_key, chat_id, chat_type,
+                                     user_id, profile_name, origin_json, message_count)
+               VALUES (?, 'cli', ?, ?, ?, 'dm', ?, 'oldname', ?, 0)""",
+            (legacy_sid, time.time(), route, legacy_sid, principal,
+             json.dumps(origin, ensure_ascii=False)))
+    db._execute_write(seed)
+
+    counts = db.rekey_profile_state("oldname", "newname")
+
+    assert counts["state_meta_receipts"] == 1
+    assert counts.get("sessions_id") is None  # the legacy id is never re-derived
+    with db._read_ctx() as conn:
+        rebased = json.loads(conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (POLICY_PREFIX + legacy_sid,),
+        ).fetchone()[0])
+        binding = json.loads(conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (LEGACY_PREFIX + legacy_sid,),
+        ).fetchone()[0])
+        assert rebased["profile_id"] == binding["profile_id"] == str(new_home)
+        assert rebased["session_id"] == rebased["legacy_session_id"] == legacy_sid
+        assert rebased["route"] == f"agent:newname:local:dm:{legacy_sid}"
+        assert rebased["entry"]["origin"]["profile"] == "newname"
+        session = conn.execute(
+            "SELECT session_key, profile_name FROM sessions WHERE id = ?", (legacy_sid,)).fetchone()
+        assert (session["session_key"], session["profile_name"]) == (
+            f"agent:newname:local:dm:{legacy_sid}", "newname")
+        validate_local_lineage(conn, rebased)
+
+
+def test_rekey_drops_stale_receipt_when_rederived_id_is_already_owned(db, tmp_path, monkeypatch):
+    """Re-deriving a LOCAL receipt's session id onto an id that already owns a receipt must drop
+    the stale receipt (superseded) instead of clobbering the fresher one; the receipt's id is not
+    re-derived further."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_state_keys import local_identity
+    from hermes_state_local import POLICY_PREFIX
+
+    old_home, new_home = tmp_path / "profiles" / "oldname", tmp_path / "profiles" / "newname"
+    principal, request = "uid:1000", 'kanban:["default","t_supersede",3]'
+    old_sid = local_identity(str(old_home), principal, request)
+    new_sid = local_identity(str(new_home), principal, request)
+    assert old_sid != new_sid
+
+    # Fresher receipt already owns the re-derived id under the new home.
+    fresher = {"session_id": new_sid, "profile_id": str(new_home), "principal_id": principal,
+               "request_id": request, "route": f"agent:newname:local:dm:{new_sid}"}
+    db._write_sql("INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                  (POLICY_PREFIX + new_sid, json.dumps(fresher, ensure_ascii=False)))
+    # Stale receipt under the old home re-derives to the same id.
+    stale = {"session_id": old_sid, "profile_id": str(old_home), "principal_id": principal,
+             "request_id": request, "route": f"agent:oldname:local:dm:{old_sid}"}
+    db._write_sql("INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                  (POLICY_PREFIX + old_sid, json.dumps(stale, ensure_ascii=False)))
+
+    counts = db.rekey_profile_state("oldname", "newname")
+
+    assert counts["state_meta_receipts"] == 0
+    assert counts["state_meta_receipts_superseded"] == 1
+    with db._read_ctx() as conn:
+        keys = {row[0] for row in conn.execute("SELECT key FROM state_meta WHERE key GLOB ?",
+                                               (POLICY_PREFIX + "*",))}
+        assert POLICY_PREFIX + old_sid not in keys
+        assert POLICY_PREFIX + new_sid in keys
+        kept = json.loads(conn.execute("SELECT value FROM state_meta WHERE key = ?",
+                                       (POLICY_PREFIX + new_sid,)).fetchone()[0])
+        assert kept == fresher
+
+
+def test_rekey_deletes_state_meta_sid_row_when_rederived_key_collides(db, tmp_path, monkeypatch):
+    """A non-receipt state_meta row that still addresses a re-derived session id is deleted when
+    the re-derived key already exists, so nothing keeps addressing the old id."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_state_keys import local_identity
+    from hermes_state_local import POLICY_PREFIX
+
+    old_home, new_home = tmp_path / "profiles" / "oldname", tmp_path / "profiles" / "newname"
+    principal, request = "uid:1000", 'kanban:["default","t_collide",4]'
+    old_sid = local_identity(str(old_home), principal, request)
+    new_sid = local_identity(str(new_home), principal, request)
+    assert old_sid != new_sid
+
+    receipt = {"session_id": old_sid, "profile_id": str(old_home), "principal_id": principal,
+               "request_id": request, "route": f"agent:oldname:local:dm:{old_sid}"}
+    db._write_sql("INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                  (POLICY_PREFIX + old_sid, json.dumps(receipt, ensure_ascii=False)))
+    # Non-receipt rows: one still names the old id, one already owns the re-derived id.
+    db._write_sql("INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                  ("vc:old:" + old_sid, "old-row"))
+    db._write_sql("INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                  ("vc:old:" + new_sid, "current-row"))
+
+    counts = db.rekey_profile_state("oldname", "newname")
+
+    assert counts["state_meta_receipts"] == 1
+    assert counts.get("state_meta_sid_refs") == 1
+    with db._read_ctx() as conn:
+        keys = {row[0] for row in conn.execute("SELECT key FROM state_meta")}
+        assert POLICY_PREFIX + old_sid not in keys
+        assert POLICY_PREFIX + new_sid in keys
+        assert "vc:old:" + old_sid not in keys   # dropped by the collision branch
+        assert "vc:old:" + new_sid in keys        # the current row survives

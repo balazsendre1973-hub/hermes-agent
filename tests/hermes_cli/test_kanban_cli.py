@@ -58,6 +58,25 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_kanban_list_label_ticket_view(kanban_home):
+    """``--label ticket`` is the ticket-flow view (hiba-ticket spec §2): only titles
+    carrying the ``ticket_id:`` prefix, ``!ticket`` inverts it so Fin's own cards stay
+    separable from tickets on the same board — and unknown labels fail closed."""
+    with kbc.connect_closing() as conn:
+        kb.create_task(conn, title="ticket_id: T-3 — cron incident", assignee="triage")
+        kb.create_task(conn, title="Fin: rendszer-kártya", assignee="fin")
+
+    tickets = json.loads(kc.run_slash("list --label ticket --json"))
+    assert [t["title"] for t in tickets] == ["ticket_id: T-3 — cron incident"]
+    others = json.loads(kc.run_slash("list --label !ticket --json"))
+    assert [t["title"] for t in others] == ["Fin: rendszer-kártya"]
+    # Unlabelled list still shows both streams (the label is a view, not a state).
+    assert len(json.loads(kc.run_slash("list --json"))) == 2
+    # Unknown label: hard error, not a silent empty view.
+    out = kc.run_slash("list --label nope --json")
+    assert "unknown label" in out
+
+
 def test_run_slash_stats_text_includes_review_lane(kanban_home):
     """``stats`` text output must surface the ``review`` lane: board_stats() counts
     every non-archived status, so the ``By status:`` block must list ``review`` too

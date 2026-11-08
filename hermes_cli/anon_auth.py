@@ -72,6 +72,19 @@ class AnonCredentialDead(AuthError):
     """
 
 
+class TrialModelUnavailable(RuntimeError):
+    """Model resolution failed: no configured model and no active welcome trial.
+
+    Raised by :func:`trial_model` as its fail-closed contract: the welcome trial (``GUEST_MODEL``,
+    ``nous/welcome``) is the last rung of resolution below every model the user named
+    (``model.default``, a cron or task pin). If the trial is not active, there is simply no model to
+    resolve — returning ``''`` would be a silent fail-open (see ``t_605d71ef``, ``t_f59435a5``, and
+    this task ``t_2f00675a``), so the absence is made explicit here and callers decide how to fail
+    closed. The exception carries no network cost and no side effect; it is raised in the same call
+    path that would otherwise have returned ``''``.
+    """
+
+
 def _anon_err(message: str, code: str, *, retry_after: Optional[float] = None) -> AuthError:
     """An ``AuthError`` for a free-tier failure *code*; terminal-ness is the code's (``ANON_TERMINAL_CODES``)."""
     return AuthError(message, code=code, retry_after=retry_after, retryable=code not in ANON_TERMINAL_CODES)
@@ -217,9 +230,16 @@ def free_inference_active(state: Any = None) -> bool:
 
 def trial_model() -> str:
     """The last rung of model resolution, below every model the user named (``model.default``, a cron
-    or task pin): ``nous/welcome`` while the welcome trial carries inference, else ''. Never written to
-    config.yaml, so it stops applying the moment the user configures a real model."""
-    return GUEST_MODEL if free_inference_active() else ""
+    or task pin): ``nous/welcome`` while the welcome trial carries inference, else raise
+    :exc:`TrialModelUnavailable`. Never written to config.yaml, so it stops applying the moment the
+    user configures a real model; if the trial has ended and no model is configured, model resolution
+    has failed and this must be surfaced, not swallowed as ``''``."""
+    if free_inference_active():
+        return GUEST_MODEL
+    raise TrialModelUnavailable(
+        "no configured model and no welcome trial active — "
+        f"set `model.default` / `model.provider` in config.yaml or claim the welcome trial"
+    )
 
 
 def has_free_tier_account() -> bool:

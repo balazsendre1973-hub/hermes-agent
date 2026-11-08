@@ -3698,7 +3698,56 @@ def _cmd_config_check(args):
         for diagnostic in diagnostics:
             print(color(f"    ⚠ {diagnostic}", Colors.YELLOW))
 
+    # (A) MEGELŐZÉSI KAPU: minden létező profilnál model.default + model.provider kötelező,
+    #     hiba szinten, soha fail-open. Hiányzás → config check RC != 0. A .deleted/ tombstone
+    #     profilok nem létezik (a -p profilfeloldáskor már RC=1-el leáll), ezért soha nem
+    #     kerülnek ide és nem generálnak saját hibát.
+    model_errors = _profile_model_config_errors(read_raw_config_readonly(), _config_profile_label())
+    if model_errors:
+        print()
+        print(color("  Per-profile model config:", Colors.BOLD))
+        for err in model_errors:
+            print(color(f"    ✗ {err}", Colors.RED))
+        return 1
+
     print()
+    return 0
+
+
+def _config_profile_label() -> Optional[str]:
+    """The profile whose config.yaml ``config check`` validates, or None for a custom home."""
+    from hermes_cli.profiles import _get_profiles_root
+
+    home = Path(get_hermes_home())
+    try:
+        home_res, root_res = home.resolve(), _get_profiles_root().resolve()
+    except OSError:
+        home_res, root_res = home, _get_profiles_root()
+    if home_res == root_res:
+        return "default"
+    if home_res.parent == root_res:
+        return home_res.name
+    return None
+
+
+def _profile_model_config_errors(config: dict[str, Any], label: Optional[str]) -> list[str]:
+    """Per-profile gate: ``model.default`` + ``model.provider`` are required, never fail-open."""
+    errors: list[str] = []
+    prefix = f"{label}: " if label else ""
+    model_cfg = config.get("model") if isinstance(config, dict) else None
+    if isinstance(model_cfg, str):
+        # Shorthand `model: <name>`: a default megvan, de provider nincs megadva.
+        model_cfg = {"default": model_cfg}
+    if not isinstance(model_cfg, dict) or not model_cfg:
+        errors.append(f"{prefix}nincs model bejegyzés a config.yaml-ben (kell: model.default + model.provider)")
+        return errors
+    default = str(model_cfg.get("default") or "").strip()
+    provider = str(model_cfg.get("provider") or "").strip()
+    if not default:
+        errors.append(f"{prefix}model.default nincs beállítva (üres vagy hiányzik)")
+    if not provider:
+        errors.append(f"{prefix}model.provider nincs beállítva (üres vagy hiányzik)")
+    return errors
 
 
 def _cmd_config_show() -> None:
@@ -3736,11 +3785,11 @@ def config_command(args):
     handler = _CONFIG_SUBCOMMANDS.get(subcmd)
     if handler is not None:
         try:
-            handler(args)
+            return handler(args)
         except ConfigWriteError as exc:  # a backend refusal (a remote lock, a secret literal): nothing changed
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
-        return
+        return None
     print(f"Unknown config command: {subcmd}")
     print()
     print(_CONFIG_USAGE)

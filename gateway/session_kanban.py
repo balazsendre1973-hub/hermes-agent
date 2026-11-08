@@ -79,8 +79,14 @@ def build_kanban_policy(connection, params, config):
     private = {}
     policy = build_policy(params_policy, config, private_secrets=private)
     if policy.model is None:
-        from gateway.run import _resolve_gateway_model
-        policy = replace(policy, model=_resolve_gateway_model(policy.config()))
+        from gateway.run import ModelResolutionError, _resolve_gateway_model
+        try:
+            policy = replace(policy, model=_resolve_gateway_model(policy.config()))
+        except ModelResolutionError as exc:
+            raise RuntimeError(
+                f"kanban task {task.id} (board={board}, assignee={task.assignee}): "
+                f"profile names no model and no welcome trial is active ({exc})",
+            ) from exc
     context = dict(params, workspace=cwd, branch=task.branch_name, tenant=task.tenant,
         profile=task.assignee, workspaces_root=str(kb.workspaces_root(board=board).resolve()),
         skills=skills, goal_mode=task.goal_mode, goal_max_turns=task.goal_max_turns,

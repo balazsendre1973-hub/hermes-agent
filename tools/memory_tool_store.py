@@ -186,11 +186,15 @@ class MemoryStore:
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, *,
-                 memory_enabled: bool = True, user_profile_enabled: bool = True):
+                 memory_enabled: bool = True, user_profile_enabled: bool = True,
+                 memdb: Optional[dict[str, Any]] = None):
         self.memory_entries: list[str] = []
         self.user_entries: list[str] = []
         self.memory_char_limit, self.user_char_limit = memory_char_limit, user_char_limit
         self.memory_enabled, self.user_profile_enabled = memory_enabled, user_profile_enabled
+        # F5 (memoria-reteg v2): mem.db Top-5 a MEMORY.md mellett, ugyanabban a
+        # memory_char_limit keretben. Konfig: memory.memdb.{enabled,path,top_k,mode}.
+        self._memdb: dict[str, Any] = dict(memdb or {})
         self._system_prompt_snapshot: dict[str, str] = {"memory": "", "user": ""}
         self._consolidation_failures = 0  # per turn; reset by reset_consolidation_failures()
 
@@ -253,6 +257,53 @@ class MemoryStore:
                                "further additions are blocked until it is back under the limit.",
                                path.name, count, limit)
             self._system_prompt_snapshot[target] = self._render_block(target, [_sanitize(e, path.name) for e in entries])
+            if target == "memory" and self.memory_enabled:
+                # F5 szelektív betöltés: a mem.db Top-5 a MEMORY.md UTÁN, vele egy
+                # keretben (memory_char_limit). Fail-open: hiba -> üres szekció.
+                self._system_prompt_snapshot[target] = self._append_memdb_section(
+                    self._system_prompt_snapshot[target], entries)
+
+    def _append_memdb_section(self, snapshot: str, entries: list[str]) -> str:
+        """F5 (memoria-reteg v2): a mem.db Top-5 szabálya a MEMORY.md blokk után.
+
+        Költségvetés: MEMORY.md KAP HELYET (soha nem vágódik le), a mem.db a
+        ``memory_char_limit - MEMORY.md`` maradékot tölti ki, a fejléccel együtt
+        is a kereten belül maradva. Bármely hiba üres szekciót ad (fail-open),
+        a MEMORY.md betöltés érintetlen — a mem.db csak OLVAS (``mode=ro``)."""
+        try:
+            from tools import memory_memdb_f5
+        except Exception:
+            logger.warning("F5: memory_memdb_f5 nem importálható — mem.db szekció kihagyva",
+                           exc_info=True)
+            return snapshot
+        used = len(ENTRY_DELIMITER.join(entries))
+        # a snapshot és a szekció közötti "\n" elválasztó is karakter
+        budget = self.memory_char_limit - used - (1 if snapshot else 0)
+        if budget < memory_memdb_f5.MIN_SECTION_CHARS:
+            # MEMORY.md betölti a keretet: a mem.db nem kap helyet (dokumentált
+            # kompromisszum: a kurált memória elsőbbsége a lekérdezett fölött).
+            logger.debug("F5: nincs hely a mem.db szekciónak (%d/%d karakter a MEMORY.md)",
+                         used, self.memory_char_limit)
+            return snapshot
+        try:
+            result = memory_memdb_f5.build_section(budget, cfg=self._memdb)
+        except Exception:
+            logger.warning("F5: mem.db szekció építése hiba — MEMORY.md betöltés érintetlen",
+                           exc_info=True)
+            return snapshot
+        section = result.get("section") or ""
+        if not section:
+            logger.debug("F5: mem.db szekció nincs betöltve (ok: %s)", result.get("reason"))
+            return snapshot
+        total = used + (1 if snapshot else 0) + len(section)
+        if total > self.memory_char_limit:   # végleges keret-ellenőrzés
+            logger.warning("F5: mem.db szekció túl hosszú (%d + %d > %d) — kihagyva",
+                           used, len(section), self.memory_char_limit)
+            return snapshot
+        logger.debug("F5: mem.db szekció betöltve: %d karakter, %d/%d sor, backend=%s, mód=%s",
+                     len(section), result.get("entries"), result.get("total_rows"),
+                     result.get("backend"), result.get("mode"))
+        return f"{snapshot}\n{section}" if snapshot else section
 
     @staticmethod
     @contextmanager

@@ -691,6 +691,22 @@ class TestSkillManageDispatcher:
 
 
 
+    def test_stringified_operations_names_stringification_not_missing_action(self, tmp_path):
+        """A model that emits `operations` as a JSON-encoded string (weak-model serialization)
+        has it repaired into a single-element list holding a plain string. The old
+        "operations[0] needs an 'action'." error blamed a missing key that is present inside
+        the stringified payload; the batch must instead say each op must be an object and hint
+        that operations was stringified. Rejected before any op applies (no rollback)."""
+        with _skill_dir(tmp_path):
+            result = json.loads(skill_manage(action="", name="",
+                                             operations=["[{\"action\": \"patch\", \"name\": \"x\", "
+                                                        "\"old_string\": \"a\", \"new_string\": \"b\"}]"]))
+        assert result["success"] is False
+        assert "operations[0]" in result["error"]
+        assert "not a batch-op object" in result["error"]
+        assert "JSON-encoded string" in result["error"]
+        assert "rolled back" not in result["error"]
+
     def test_write_file_given_content_names_the_reverse_misplacement(self, tmp_path):
         """#112677 — the reverse direction: create's `content` sent to write_file. Checked on the
         legacy flat call shape so both entry points share the one hint chokepoint."""

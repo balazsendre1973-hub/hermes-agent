@@ -111,6 +111,18 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
     if delivery_outcome in ("delivered", "not_configured") and not d.success:
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         scheduler._mark_incident_alerted(d.failure_incident_id)
+    incident_id = getattr(d, "failure_incident_id", None)
+    if incident_id and delivery_outcome != "queued":
+        # Phase 3a (T2 §3.1): the ``delivery`` failure_type follows this run's delivery
+        # OUTCOME, not the error text. ``queued`` is not final — the drain/settle hooks
+        # (cron/scheduler.drain_delivery_queue, cron/delivery_outcome) finish it there.
+        try:
+            from cron.incidents import reclassify_incident_for_delivery
+            reclassify_incident_for_delivery(
+                incident_id, delivery_failed=(delivery_outcome == "failed"))
+        except Exception as exc:
+            scheduler.logger.debug(
+                "Incident delivery reclassification failed for %s: %s", incident_id, exc)
     from functools import partial
     from cron.executions import FIRER_FINISHED_STATES, get_execution, recover_receipted_execution
     finish = partial(recover_receipted_execution, job_id=job['id']) if recovered else scheduler.finish_execution

@@ -10,6 +10,7 @@ parity across every registered verb.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from pathlib import Path
@@ -1025,6 +1026,112 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Gateway embedded dispatcher watcher: stuck-log level follows the hold reason
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "held_result, expect_level, expect_contains, expect_absent",
+    [
+        pytest.param(
+            kb.DispatchResult(held_back_capacity=(3, 3)),
+            logging.INFO,
+            ("held back by capacity", "capacity=3/3"),
+            ("profile health", "dispatcher stuck"),
+            id="capacity-hold-logs-info-not-warning",
+        ),
+        pytest.param(
+            kb.DispatchResult(held_back_max_spawn=(8, 8)),
+            logging.INFO,
+            ("held back by capacity", "max_spawn=8/8"),
+            ("profile health", "dispatcher stuck"),
+            id="max-spawn-hold-logs-info-not-warning",
+        ),
+        pytest.param(
+            kb.DispatchResult(),
+            logging.WARNING,
+            ("dispatcher stuck", "profile health", "venv, PATH, credentials"),
+            ("held back by capacity",),
+            id="unknown-hold-keeps-warning-with-profile-health",
+        ),
+    ],
+)
+def test_gateway_dispatcher_stuck_level_follows_hold_reason(
+    monkeypatch, caplog, held_result, expect_level, expect_contains, expect_absent
+):
+    """Capacity/max_spawn holds log at INFO with the real next-step advice;
+    unknown holds keep the WARNING with profile-health guidance."""
+    import asyncio
+    import logging
+
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+    from gateway.kanban_watchers_dispatcher import _KanbanDispatcher
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {"kanban": {"dispatch_in_gateway": True, "dispatch_interval_seconds": 1}},
+    )
+    monkeypatch.setattr(
+        _kb,
+        "list_boards",
+        lambda include_archived=False: [{"slug": _kb.DEFAULT_BOARD}],
+    )
+    monkeypatch.setattr(_kb, "read_board_metadata", lambda slug: {"slug": slug})
+    monkeypatch.setattr(_kbd, "reap_worker_zombies", lambda: [])
+
+    calls = {"to_thread": 0}
+
+    async def _to_thread(fn, *args, **kwargs):
+        calls["to_thread"] += 1
+        outcome = fn(*args, **kwargs)
+        # 4 offloads per tick (reaper, auto-decompose, tick_once, ready_nonempty);
+        # stop the loop once tick 6 (bad_ticks == _HEALTH_WINDOW) has run.
+        if calls["to_thread"] >= 24:
+            runner._running = False
+        return outcome
+
+    async def _sleep(_delay):
+        return None
+
+    monkeypatch.setattr(
+        _KanbanDispatcher,
+        "tick_once",
+        lambda self: [(_kb.DEFAULT_BOARD, held_result)],
+    )
+    monkeypatch.setattr(_KanbanDispatcher, "ready_nonempty", lambda self: True)
+    monkeypatch.setattr(
+        _KanbanDispatcher, "auto_decompose_tick", lambda self, per_tick: 0
+    )
+    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
+
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        asyncio.run(
+            asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=5.0)
+        )
+
+    matching = [
+        r for r in caplog.records if all(s in r.getMessage() for s in expect_contains)
+    ]
+    assert len(matching) == 1, (
+        f"expected exactly one record with {expect_contains}, got: "
+        f"{[r.getMessage() for r in caplog.records]}"
+    )
+    assert matching[0].levelno == expect_level
+    for snippet in expect_absent:
+        assert not any(snippet in r.getMessage() for r in caplog.records), (
+            f"forbidden {snippet!r} in: {[r.getMessage() for r in caplog.records]}"
+        )
 
 
 # ---------------------------------------------------------------------------

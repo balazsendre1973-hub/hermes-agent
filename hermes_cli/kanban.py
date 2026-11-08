@@ -420,6 +420,21 @@ def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
+    label = getattr(args, "label", None)
+    # Ticket-flow view (hiba-ticket spec §2): the ``ticket_id:`` title prefix is the label;
+    # Fin's own cards carry no prefix, so ``--label ticket`` / ``--label !ticket`` cleanly
+    # separate the two streams without a second board.
+    label_prefix = None
+    label_negated = False
+    if label is not None:
+        _LABEL_PREFIXES = {"ticket": "ticket_id:"}
+        negated = label.startswith("!")
+        name = label[1:] if negated else label
+        if name not in _LABEL_PREFIXES:
+            return _err(
+                f"kanban: unknown label {label!r} (known: {', '.join(sorted(_LABEL_PREFIXES))})",
+                2)
+        label_prefix, label_negated = _LABEL_PREFIXES[name], negated
     with kbc.connect_closing() as conn:
         # Cheap mini-dispatch so list reflects dependencies cleared since the last tick.
         kb.recompute_ready(conn)
@@ -428,6 +443,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
             include_archived=args.archived, order_by=getattr(args, "sort", None),
             workflow_template_id=args.workflow_template_id, current_step_key=args.current_step_key,
         )
+    if label_prefix is not None:
+        tasks = [
+            t for t in tasks
+            if ((t.title or "").startswith(label_prefix)) != label_negated
+        ]
     if _json_out(args, [_task_to_dict(t) for t in tasks]):
         return 0
     # Passive discoverability: only multi-board users see which board this is.

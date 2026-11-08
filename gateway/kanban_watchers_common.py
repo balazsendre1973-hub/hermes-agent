@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 from contextvars import Context
 from pathlib import Path
@@ -44,6 +45,37 @@ def _list_boards(kb: Any) -> list:
 
 def _board_slugs(kb: Any) -> list:
     return [b.get("slug") or kb.DEFAULT_BOARD for b in _list_boards(kb)]
+
+DEFAULT_BOARD_STATUS = Path.home() / ".hermes" / "kanban" / "board_status.json"
+
+
+def board_status_path(kanban_cfg: dict | None) -> Path:
+    """``kanban.board_status_file`` config key; default
+    ``~/.hermes/kanban/board_status.json`` — the same contract as
+    ``error_card_gate.board_status_file``."""
+    raw = str((kanban_cfg or {}).get("board_status_file") or "").strip()
+    return Path(raw).expanduser() if raw else DEFAULT_BOARD_STATUS
+
+
+def parked_board_slugs(kanban_cfg: dict | None = None) -> set[str]:
+    """Slugok, amiket a dispatcher soha ne indítson: a `board_status.json`
+    `parked` listája (a Fin szerkeszti).
+
+    Fail-open: hiányzó/nem-olvasható/érvénytelen fájl → üres halmaz
+    (minden board aktív). A `parked` lista minden olvasható fájlban
+    érvényes.
+    """
+    path = board_status_path(kanban_cfg)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    parked = data.get("parked")
+    if not isinstance(parked, list):
+        return set()
+    return {str(x).strip() for x in parked if str(x).strip()}
 
 
 def _positive_int_setting(kanban_cfg: dict, key: str) -> Optional[int]:

@@ -1,0 +1,81 @@
+{
+ "root_receipts_mentioning_writerchan": 14,
+ "samples": [
+  {
+   "key": "gateway.local_policy.v1:local-8e71243171c247537708de862c36deecd56bc817",
+   "profile_id": "/home/endre/.hermes",
+   "route": "agent:main:local:dm:local-8e71243171c247537708de862c36deecd56bc817ac04b27708e63de977a7b5b9",
+   "session_id": "local-8e71243171c247537708de862c36deecd56bc817ac04",
+   "entry_session_key": "agent:main:local:dm:local-8e71243171c247537708de862c36deecd56bc817ac04b27708e63de977a7b5b9",
+   "entry_origin_profile": null,
+   "value_has_writerchan_at": 10614
+  },
+  {
+   "key": "gateway.local_policy.v1:local-92e542a9879caa700bbb84b25ea422a932526780",
+   "profile_id": "/home/endre/.hermes",
+   "route": "agent:main:local:dm:local-92e542a9879caa700bbb84b25ea422a932526780fad6937fb68578061c2b2314",
+   "session_id": "local-92e542a9879caa700bbb84b25ea422a932526780fad6",
+   "entry_session_key": "agent:main:local:dm:local-92e542a9879caa700bbb84b25ea422a932526780fad6937fb68578061c2b2314",
+   "entry_origin_profile": null,
+   "value_has_writerchan_at": 29047
+  },
+  {
+   "key": "gateway.local_policy.v1:local-32865b5217c3362c9ad1efa5d53f7febb595881a",
+   "profile_id": "/home/endre/.hermes",
+   "route": "agent:main:local:dm:local-32865b5217c3362c9ad1efa5d53f7febb595881ab96175c05c7d858a1e51520a",
+   "session_id": "local-32865b5217c3362c9ad1efa5d53f7febb595881ab961",
+   "entry_session_key": "agent:main:local:dm:local-32865b5217c3362c9ad1efa5d53f7febb595881ab96175c05c7d858a1e51520a",
+   "entry_origin_profile": null,
+   "value_has_writerchan_at": 12102
+  },
+  {
+   "key": "gateway.local_policy.v1:local-6b0da46b921fa11827001390b619456f1dc51d7b",
+   "profile_id": "/home/endre/.hermes",
+   "route": "agent:main:local:dm:local-6b0da46b921fa11827001390b619456f1dc51d7b3058d4d7154ff1971afa7653",
+   "session_id": "local-6b0da46b921fa11827001390b619456f1dc51d7b3058",
+   "entry_session_key": "agent:main:local:dm:local-6b0da46b921fa11827001390b619456f1dc51d7b3058d4d7154ff1971afa7653",
+   "entry_origin_profile": null,
+   "value_has_writerchan_at": 10763
+  },
+  {
+   "key": "gateway.local_policy.v1:local-cc2f0abb74978b91f0710f552c174451d8111cd1",
+   "profile_id": "/home/endre/.hermes",
+   "route": "agent:main:local:dm:local-cc2f0abb74978b91f0710f552c174451d8111cd1d806d089a2ca29e378c311cb",
+   "session_id": "local-cc2f0abb74978b91f0710f552c174451d8111cd1d806",
+   "entry_session_key": "agent:main:local:dm:local-cc2f0abb74978b91f0710f552c174451d8111cd1d806d089a2ca29e378c311cb",
+   "entry_origin_profile": null,
+   "value_has_writerchan_at": 11505
+  },
+  {
+   "key": "gateway.local_policy.v1:local-e6214a5c05ba745ac84182e8b37facedcd8045d1",
+   "profile_id": "/home/endre/.hermes",
+   "route": "agent:main:local:dm:local-e6214a5c05ba745ac84182e8b37facedcd8045d1bbfea06deaa43fc56b25bec9",
+   "session_id": "local-e6214a5c05ba745ac84182e8b37facedcd8045d1bbfe",
+   "entry_session_key": "agent:main:local:dm:local-e6214a5c05ba745ac84182e8b37facedcd8045d1bbfea06deaa43fc56b25bec9",
+   "entry_origin_profile": null,
+   "value_has_writerchan_at": 10891
+  }
+ ],
+ "root_receipts_writerchan_field": {
+  "policy": 14
+ },
+ "root_old_sessions": 0,
+ "get_profile_dir_writerchan": "/home/endre/.hermes/profiles/writerchan",
+ "get_profile_dir_max": "/home/endre/.hermes/profiles/max",
+ "get_profile_dir_logchan": "/home/endre/.hermes/profiles/logchan",
+ "get_profile_dir_mel": "/home/endre/.hermes/profiles/mel",
+ "named_profile_dirs": [
+  "coder",
+  "debugger",
+  "jane",
+  "jared",
+  "kanban",
+  "logchan",
+  "mel",
+  "researcher",
+  "triage",
+  "verifier",
+  "writer"
+ ],
+ "query_gateway_control_src": "def query_gateway_control(home: Path, verb: str, *, params: Optional[dict[str, Any]] = None,\n                          timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:\n    \"\"\"Ask the gateway serving ``home`` a control verb; returns its ``result`` payload. Any failure (no/stale\n    socket, timeout, malformed answer, ``ok: false``) returns None so callers fall back to the scan layer.\n    ``params`` carries verb arguments (e.g. ``{\"old\": ..., \"new\": ...}``). Never raises.\"\"\"\n    payload: dict[str, Any] = {\"verb\": verb, \"id\": 1, \"protocol\": CONTROL_PROTOCOL_VERSION}\n    if params:\n        payload[\"params\"] = params\n    request = json.dumps(payload).encode(\"utf-8\") + b\"\\n\"\n    query = _query_windows_pipe if _IS_WINDOWS else _query_unix_socket\n    try:\n        raw = query(Path(home), request, timeout)\n        response = json.loads(raw.decode(\"utf-8\")) if raw else None\n    except Exception:\n        return None\n    result = response.get(\"result\") if isinstance(response, dict) and response.get(\"ok\") is True else None\n    return result if isinstance(result, dict) else None\n"
+}

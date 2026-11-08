@@ -145,6 +145,42 @@ def test_error_change_mints_new_incident(monkeypatch, tmp_path):
     assert inc.count_incidents() == 2
 
 
+def test_error_signature_masks_run_varying_ora_counter(monkeypatch, tmp_path):
+    """| N óra (órák) futásonként változik az azonos riasztásban — az aláírásnak
+    meg kell maradnia az azonosnak (1 hiba = 1 incidens, nem 6)."""
+    inc = _point_db(monkeypatch, tmp_path)
+    base = ("NEXT_CARD_WATCH ALERT MOZDULATLAN_KARTYA board=us_tech100-steps "
+            "id=t_8cc491c9 — t_x | {} óra frissítés nélkül (utolsó: created, status=todo)")
+    sig_158 = inc._error_signature("afd070380cb2", base.format(158))
+    sig_159 = inc._error_signature("afd070380cb2", base.format(159))
+    assert sig_158 == sig_159, "egyzelfde hiba különböző óraszámmal → azonos aláírás"
+
+
+def test_error_signature_same_alert_twice_same_incident(monkeypatch, tmp_path):
+    inc = _point_db(monkeypatch, tmp_path)
+    alert = ("NEXT_CARD_WATCH ALERT MOZDULATLAN_KARTYA board=us_tech100-steps "
+             "id=t_8cc491c9 — t_x | 158 óra frissítés nélkül (utolsó: created, status=todo)")
+    id1, new1 = inc.upsert_incident("afd070380cb2", alert)
+    id2, new2 = inc.upsert_incident("afd070380cb2", alert)
+    assert new1 is True and new2 is False
+    assert id1 == id2, "kétszer ugyanaz a riasztás-kimenet → azonos incidens-id"
+    assert inc.count_incidents() == 1
+
+
+def test_error_signature_different_cards_different_incident(monkeypatch, tmp_path):
+    """Két különböző kártya ugyanazon az óraszámmal → különböző incidens-id-ek
+    (a statikus board/kártya-id/riasztás-típus rész az aláírásban marad)."""
+    inc = _point_db(monkeypatch, tmp_path)
+    card_a = ("NEXT_CARD_WATCH ALERT MOZDULATLAN_KARTYA board=us_tech100-steps "
+              "id=t_8cc491c9 — t_a | 158 óra frissítés nélkül")
+    card_b = ("NEXT_CARD_WATCH ALERT MOZDULATLAN_KARTYA board=us_tech100-steps "
+              "id=t_ff97e7d3 — t_b | 158 óra frissítés nélkül")
+    id_a, _ = inc.upsert_incident("afd070380cb2", card_a)
+    id_b, _ = inc.upsert_incident("afd070380cb2", card_b)
+    assert id_a != id_b, "különböző kártya → különböző incidens-id"
+    assert inc.count_incidents() == 2
+
+
 # ── Redaction / classification ─────────────────────────────────────────────
 
 
@@ -179,7 +215,6 @@ def test_error_truncated_to_bounded_length(monkeypatch, tmp_path):
 def test_failure_type_classification(monkeypatch, tmp_path):
     inc = _point_db(monkeypatch, tmp_path)
     cases = [
-        ("delivery failed for telegram chat", "delivery"),
         ("Provider read timed out after 60s", "timeout"),
         ("authentication failed: invalid API key", "auth"),
         ("HTTP 429: rate limit exceeded", "rate_limit"),
@@ -190,6 +225,15 @@ def test_failure_type_classification(monkeypatch, tmp_path):
     ]
     for error, expected in cases:
         assert inc._classify_failure_type(error) == expected, (error, expected)
+
+    # Phase 3a (T2 §3.1): the ``delivery`` bucket is OUTCOME-driven. Error text that
+    # merely MENTIONS delivery (the measured T-2 probe mislabel: intentional failure
+    # whose stderr carried ``failure_deliver``) must NOT classify as ``delivery`` —
+    # and the same text does classify once the caller knows the send actually failed.
+    prose = "delivery failed for telegram chat"
+    assert inc._classify_failure_type(prose) != "delivery"
+    assert inc._classify_failure_type(prose, delivery_failed=True) == "delivery"
+    assert inc._classify_failure_type("failure_deliver bot-chat:triage exploded") != "delivery"
 
 
 # ── Lifecycle / ack ────────────────────────────────────────────────────────

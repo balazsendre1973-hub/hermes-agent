@@ -208,6 +208,8 @@ docs/superpowers/*
 /gateway/discord_message_recovery.db*
 /sessions/
 /browser-profile/
+# Session dump files created by `hermes sessions export <session-id>` (bare export bug)
+local-*
 /cron/*.db
 /cron/*.db-wal
 /cron/*.db-shm

@@ -10,6 +10,7 @@ pre-write input checks and the SQL triggers that catch direct DB writes.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -94,6 +95,38 @@ class TestSqlTriggers:
             tid = kb.create_task(conn, title="t", assignee=None)
             conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (tid,))
             assert conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()["status"] == "todo"
+
+    def test_triggers_contain_every_valid_status(self, board):
+        """The SQL gate's NOT IN lists track VALID_STATUSES, not a snapshot
+        from when the trigger was first created: ``CREATE TRIGGER IF NOT EXISTS``
+        never replaced stale triggers, which is exactly how ``revoked-by-Fin``
+        went missing and every direct write of it hit SQLITE_CONSTRAINT 19.
+        Triggers are now dropped + recreated from VALID_STATUSES on every init,
+        so the two layers cannot drift apart unnoticed.
+        """
+        with kbc.connect() as conn:
+            rows = {
+                name: sql
+                for name, sql in conn.execute(
+                    "SELECT name, sql FROM sqlite_master "
+                    "WHERE type='trigger' AND name LIKE 'trg_tasks_status_gate%'"
+                ).fetchall()
+            }
+        assert set(rows) == {"trg_tasks_status_gate_insert", "trg_tasks_status_gate_update"}
+        for sql in rows.values():
+            inside = sql[sql.index("NOT IN (") + len("NOT IN ("): sql.index(")", sql.index("NOT IN ("))]
+            allowed = {piece.strip().strip("'") for piece in inside.split(",")}
+            assert allowed == set(kb.VALID_STATUSES), sql
+
+    @pytest.mark.parametrize("status", sorted(kb.VALID_STATUSES))
+    def test_every_valid_status_passes_the_status_gate(self, board, status):
+        """Direct SQL write of every VALID_STATUSES value passes the trigger,
+        including ``revoked-by-Fin`` (previously SQLITE_CONSTRAINT 19)."""
+        with kbc.connect() as conn:
+            tid = kb.create_task(conn, title="t", assignee=None)
+            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
+            row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+        assert row["status"] == status
 
 
 # --------------------------------------------------------------------------- #

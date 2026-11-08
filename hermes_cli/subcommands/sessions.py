@@ -242,8 +242,10 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
             "files) for durable state crossed between profiles: rows whose profile_name "
             "disagrees with their session key, rows sitting in another profile's store, "
             "parent links crossing namespaces, routing rows outside the default store or for a "
-            "profile that no longer exists, and Telegram topic / voice-mode entries missing "
-            "their bot's profile. Reports without touching anything unless --apply is given; "
+            "profile that no longer exists, Telegram topic / voice-mode entries missing "
+            "their bot's profile, and LOCAL creation receipts in state_meta whose profile_id "
+            "names a profile other than their own store's home (boot refuses those with "
+            "profile_mismatch). Reports without touching anything unless --apply is given; "
             "--apply refuses while a gateway is running, snapshots every store first, and is "
             "safe to re-run.")
     _flag(sessions_repair_profiles, "--apply", help="Perform the repairs (default: report only)")
@@ -255,6 +257,13 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
             "to that profile (a standalone gateway's own history, e.g. after multiplexing was "
             "switched on), 'move' them to the default store (a default chat that leaked in), or "
             "'report' (default) — the rows themselves cannot tell the two cases apart")
+    sessions_repair_profiles.add_argument(
+        "--orphan-receipts", choices=("retire", "rekey", "report"), default="retire",
+        help="What to do with a state_meta LOCAL creation receipt whose profile_id names another "
+            "profile: 'retire' (default) drops the receipt and keeps the guarded session's "
+            "transcript as history, 'rekey' moves the receipt onto that store's profile keeping "
+            "its session id, 'report' leaves them alone (they still refuse every boot with "
+            "profile_mismatch)")
 
     sessions_repair_prompts = sessions_subparsers.add_parser(
         "repair-prompts", help="Report or clear stored system prompts degraded to a reduced-toolset build",

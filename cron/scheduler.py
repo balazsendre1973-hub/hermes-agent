@@ -1372,6 +1372,17 @@ def drain_delivery_queue(adapters, loop) -> int:
         if (not error and queued_for_failure
                 and not queued_job.get("_notification_all_targets_suppressed")):
             _mark_incident_alerted(queued_job.get("_failure_incident_id"))
+        # Phase 3a (T2 §3.1): the queued send's real outcome decides the incident's
+        # ``delivery`` bucket (the queue row carries the id; settle repeats this
+        # idempotently for the fence/unknown paths). Best-effort by contract.
+        incident_id = queued_job.get("_failure_incident_id")
+        if incident_id and queued_for_failure:
+            try:
+                from cron.incidents import reclassify_incident_for_delivery
+                reclassify_incident_for_delivery(incident_id, delivery_failed=bool(error))
+            except Exception as exc:
+                logger.debug(
+                    "Incident delivery reclassification failed for %s: %s", incident_id, exc)
         return error
 
     return drain(send)
@@ -1604,8 +1615,10 @@ class _CronJobConfig:
 def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConfig:
     """Load config.yaml and resolve the run's model: per-job pin > cron.model (fleet default) >
     the main agent model (config ``model:``, then HERMES_MODEL) > the claimed welcome trial's. Re-read
-    every tick (no cache) so ``hermes cron edit --model`` and ``hermes model`` both apply next tick."""
-    from hermes_cli.anon_auth import trial_model
+    every tick (no cache) so ``hermes cron edit --model`` and ``hermes model`` both apply next tick.
+    Fail-open: ``TrialModelUnavailable`` is caught here and translated to the existing ``no model``
+    guard, so the cron error message stays about the job's own configuration."""
+    from hermes_cli.anon_auth import TrialModelUnavailable, trial_model
     model = job.get("model") or cron_env_setting("HERMES_MODEL") or ""
     _cron_default_provider = ""
     _cfg: dict = {}
@@ -1634,7 +1647,10 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
                     model = str(_main or "").strip() or model
     except Exception as e:  # ConfigBackendUnavailable is not one: run_job fails this fire, never defaults
         logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
-    model = (model if isinstance(model, str) else "").strip() or trial_model()
+    try:
+        model = (model if isinstance(model, str) else "").strip() or trial_model()
+    except TrialModelUnavailable:
+        model = ""
     # Fail fast: an empty model otherwise reaches the provider as an opaque 400 (#23979).
     if not model:
         raise RuntimeError(
@@ -3195,6 +3211,17 @@ def _deliver_crash_failure(
         notification_suppressed=bool(job.get("_notification_all_targets_suppressed")))
     if delivery_outcome in ("delivered", "not_configured"):
         _mark_incident_alerted(failure_incident_id)
+    if failure_incident_id and delivery_outcome != "queued":
+        # Phase 3a (T2 §3.1): the ``delivery`` bucket follows this send's outcome, not the
+        # error text (see cron.incidents.reclassify_incident_for_delivery). Best-effort:
+        # a classification hiccup must never break the failure delivery itself.
+        try:
+            from cron.incidents import reclassify_incident_for_delivery
+            reclassify_incident_for_delivery(
+                failure_incident_id, delivery_failed=(delivery_outcome == "failed"))
+        except Exception as exc:
+            logger.debug(
+                "Incident delivery reclassification failed for %s: %s", failure_incident_id, exc)
     return delivery_error, delivery_outcome
 
 

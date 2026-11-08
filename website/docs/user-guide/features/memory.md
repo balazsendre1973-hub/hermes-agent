@@ -14,7 +14,7 @@ Two files make up the agent's memory:
 
 | File | Purpose | Char Limit |
 |------|---------|------------|
-| **MEMORY.md** | Agent's personal notes — environment facts, conventions, things learned | 3,000 chars (~1090 tokens) |
+| **MEMORY.md** | Agent's personal notes — environment facts, conventions, things learned | 2,200 chars (~800 tokens) |
 | **USER.md** | User profile — your preferences, communication style, expectations | 1,375 chars (~500 tokens) |
 
 Both are stored in `~/.hermes/memories/` and are injected into the system prompt as a frozen snapshot at session start. The agent manages its own memory via the `memory` tool — it can add, patch, or remove entries.
@@ -39,7 +39,7 @@ At the start of every session, memory entries are loaded from disk and rendered 
 
 ```
 ══════════════════════════════════════════════
-MEMORY (your personal notes) [49% — 1,474/3,000 chars]
+MEMORY (your personal notes) [67% — 1,474/2,200 chars]
 ══════════════════════════════════════════════
 User's project is a Rust web service at ~/code/myapi using Axum + SQLx
 §
@@ -85,7 +85,7 @@ The most common report looks like this: you tell the agent where something lives
 
 5. **Remember the snapshot is frozen at session start.** A fact saved in the current session is visible to the *next* session, not to another session that was already running. Start a new session (`/new`, or a fresh CLI invocation) after the write.
 
-Two things that do **not** make the agent remember: variables in `.env` (those are credentials and settings, not memory) and facts mentioned in passing without asking for them to be saved. For a location the agent needs on every run of a recurring task, a [skill](./skills.md) is often the better home than a memory entry — it loads only when relevant and does not compete for the 3,000-character budget.
+Two things that do **not** make the agent remember: variables in `.env` (those are credentials and settings, not memory) and facts mentioned in passing without asking for them to be saved. For a location the agent needs on every run of a recurring task, a [skill](./skills.md) is often the better home than a memory entry — it loads only when relevant and does not compete for the 2,200-character budget.
 
 ## Memory Tool Actions
 
@@ -179,7 +179,7 @@ Memory has strict character limits to keep system prompts bounded:
 
 | Store | Limit | Typical entries |
 |-------|-------|----------------|
-| memory | 3,000 chars | 8-15 entries |
+| memory | 2,200 chars | 8-15 entries |
 | user | 1,375 chars | 5-10 entries |
 
 ### What Happens When Memory is Full
@@ -189,9 +189,9 @@ When you try to add an entry that would exceed the limit, the tool returns an er
 ```json
 {
   "success": false,
-  "error": "Memory at 2,900/3,000 chars; adding this entry (250 chars) would exceed the limit by 150 chars. Retry as ONE 'operations' batch that removes or shortens (patch) stale entries from current_entries below to free at least 150 chars AND adds this entry — the limit is checked only on the batch result.",
+  "error": "Memory at 2,100/2,200 chars; adding this entry (250 chars) would exceed the limit by 153 chars. Retry as ONE 'operations' batch that removes or shortens (patch) stale entries from current_entries below to free at least 153 chars AND adds this entry — the limit is checked only on the batch result.",
   "current_entries": ["..."],
-  "usage": "2,900/3,000"
+  "usage": "2,100/2,200"
 }
 ```
 
@@ -287,7 +287,7 @@ The same `list` / `delete <id>` / `edit <id>` subcommands work from the in-chat 
 memory:
   memory_enabled: true
   user_profile_enabled: true
-  memory_char_limit: 3000   # ~1090 tokens
+  memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
   write_approval: false     # false = write freely (default) | true = require approval
   prefetch_spill_enabled: false  # external recall stays intact unless explicitly enabled

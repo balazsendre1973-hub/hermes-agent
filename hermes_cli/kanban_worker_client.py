@@ -121,27 +121,28 @@ async def _discard(events):
 async def _await_receipt(client, params, board_db, claim):
     """Submit the claim (or, on a later connection, re-read the admission it got) and return its
     settled receipt, recording each owner answer on *claim*."""
-    if claim.admission_id is None:
-        db = str(await asyncio.to_thread(Path(board_db).resolve))
-        # The owner answers only after it checks the claim and writes its ``owner_admitted`` marker
-        # in one board write transaction. The board (the cross-profile dispatch bus) can make that
-        # wait out its busy timeout, so the 30 s default left the owner admitting an attempt whose
-        # submitter had exited (the later-bound worker's submitter-liveness watcher ended it, and the
-        # admission was left ``unknown``). The wait is still finite: once the marker commits,
-        # ``enforce_max_runtime`` and TTL reclaim skip the run (``owner_reclaim_paused``), so an owner
-        # that stalls after admitting is bounded by this wait and ``OWNER_WAIT_S``.
-        accepted = await client.rpc('kanban.run', _timeout=admission_answer_budget(), **dict(params, db=db))
-        receipt = accepted['receipt']
-        claim.session_id, claim.admission_id = accepted['session_id'], receipt['admission_id']
-        print(f'Session: {claim.session_id}', file=sys.stderr)
-    else:
-        receipt = await _receipt(client, claim)
-    claim.answered = time.monotonic()
-    while receipt['status'] not in {'terminal', 'unknown'}:
-        await asyncio.sleep(.2)
-        receipt = await _receipt(client, claim)
+    while True:
+        if claim.admission_id is None:
+            db = str(await asyncio.to_thread(Path(board_db).resolve))
+            accepted = await client.rpc('kanban.run', _timeout=admission_answer_budget(), **dict(params, db=db))
+            receipt = accepted['receipt']
+            claim.session_id, claim.admission_id = accepted['session_id'], receipt['admission_id']
+            print(f'Session: {claim.session_id}', file=sys.stderr)
+        else:
+            receipt = await _receipt(client, claim)
         claim.answered = time.monotonic()
-    return receipt
+        while receipt['status'] not in {'terminal', 'unknown'}:
+            await asyncio.sleep(.2)
+            receipt = await _receipt(client, claim)
+            claim.answered = time.monotonic()
+        # If the owner fenced this admission 'unknown' (gateway restart via recover_session_inputs),
+        # but the worker is still alive and retrying, clear the admission and re-call kanban.run
+        # (idempotent per attempt) to get a fresh admission.
+        if receipt['status'] == 'unknown':
+            claim.admission_id = None
+            claim.session_id = None
+            continue
+        return receipt
 
 
 def _exit_code(receipt, params, board_db):

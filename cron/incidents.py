@@ -46,6 +46,11 @@ _MAX_SIGNATURE_ERROR_CHARS = 200
 _DURATION_RE = re.compile(
     r"\b\d+(?:\.\d+)?\s*(?:ms|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\b"
 )
+# A futásonként változó óraszámláló a riasztás-szövegben (pl. "| 24 óra frissítés nélkül"):
+# az óraszám minden futáson más lehet, ezért az aláírásból ki kell maszkolni — a statikus
+# rész (board, kártya-id, riasztás-típus) megmarad, így két különböző kártya hibája továbbra is
+# különböző incidens. Az "óra" magyar egysége nem szerepel _DURATION_RE-ben, ezért egyedi maszk.
+_COUNTER_RE = re.compile(r"\|\s*\d+\s*óra\b")
 
 _lock = threading.RLock()
 
@@ -129,8 +134,17 @@ def _redact_error(error: str) -> str:
 
 
 def _error_signature(job_id: str, error: str) -> str:
-    """Dedup key: stable for same job + same normalized error prefix."""
-    normalized = _DURATION_RE.sub("#s", _normalize_error(error))[:_MAX_SIGNATURE_ERROR_CHARS]
+    """Dedup key: stable for same job + same normalized error prefix.
+
+    The run-varying ``| N óra`` counter (Hungarian "hours") that the watchers
+    embed in the alert text is masked before signing, so the same failure
+    resolves to the SAME incident id run after run (1 hiba = 1 incidens).
+    English durations are masked by ``_DURATION_RE``; status codes and other
+    numbers still count. The static part (board, card id, alert type) is kept,
+    so two different cards' errors still mint two different incidents.
+    """
+    normalized = _COUNTER_RE.sub("| <N> óra", _normalize_error(error))
+    normalized = _DURATION_RE.sub("#s", normalized)[:_MAX_SIGNATURE_ERROR_CHARS]
     return hashlib.sha256(job_id.encode() + normalized.encode()).hexdigest()[:12]
 
 
@@ -138,36 +152,53 @@ def _incident_id(job_id: str, error_sig: str) -> str:
     return f"{job_id[:6]}_{error_sig}"
 
 
-def _classify_failure_type(error: str) -> str:
-    """Classify a failure from error-text keywords; ``unknown`` is the default."""
+def _classify_failure_type(error: str, *, delivery_failed: bool = False) -> str:
+    """Classify a failure from error-text keywords; ``unknown`` is the default.
+
+    Phase 3a (T2 §3.1): the ``delivery`` bucket is outcome-driven, never keyword-driven —
+    an intentional failure whose stderr merely MENTIONED ``failure_deliver`` (the measured
+    T-2 mislabel) must not become a ``delivery`` incident while the send itself succeeded.
+    The delivery needles therefore only run when the caller already knows the send failed
+    (``delivery_failed=True``); every other bucket is unchanged.
+    """
     text = _normalize_error(error)
     if not text:
-        return "unknown"
+        return "delivery" if delivery_failed else "unknown"
     for kind, patterns in _FAILURE_TYPE_ORDER:
+        if kind == "delivery" and not delivery_failed:
+            continue
         for pattern in patterns:
             if pattern.startswith("\\b") and pattern.endswith("\\b"):
                 if re.search(pattern, text):
                     return kind
             elif pattern in text:
                 return kind
-    return "unknown"
+    # No root-cause keyword matched. A known FAILED send is itself the finding (the
+    # operator's ping never landed); a successful/unknown send has nothing to name.
+    return "delivery" if delivery_failed else "unknown"
 
 
 def upsert_incident(
     job_id: str, error: str, *, job_name: Optional[str] = None, failure_type: Optional[str] = None,
-    output_file: Optional[str] = None,
+    output_file: Optional[str] = None, delivery_failed: Optional[bool] = None,
 ) -> tuple[str, bool]:
     """Record (or refresh) the incident for ``job_id`` + ``error``; returns ``(incident_id,
     is_new)``. An existing row for the signature refreshes
     ``last_seen_at``/``error``/``output_file`` and keeps its state — a ``closed`` incident stays
     closed, while a ``resolved`` one (job recovered, then broke the same way again) re-opens as
-    ``detected`` so the operator is alerted once more. A changed error text mints a new incident."""
+    ``detected`` so the operator is alerted once more. A changed error text mints a new incident.
+
+    ``delivery_failed`` (phase 3a) is the delivery subsystem's outcome for the run when the
+    caller already knows it; without it the ``delivery`` bucket is never minted from error
+    text (see :func:`_classify_failure_type`) — the scheduler's post-delivery hook
+    (:func:`reclassify_incident_for_delivery`) settles it once the send has actually run."""
     job_id = str(job_id or "")
     sig = _error_signature(job_id, error)
     stored_error = _redact_error(error)
     incident_id = _incident_id(job_id, sig)
     now = _hermes_now().isoformat()
-    failure_type = failure_type or _classify_failure_type(error)
+    failure_type = failure_type or _classify_failure_type(
+        error, delivery_failed=bool(delivery_failed))
     output_file = str(output_file) if output_file is not None else None
 
     with _transaction() as conn:
@@ -195,6 +226,66 @@ def upsert_incident(
              stored_error, output_file),
         )
         return incident_id, True
+
+
+def reclassify_incident_for_delivery(incident_id: str, *, delivery_failed: bool) -> bool:
+    """Correct ``failure_type`` once the delivery subsystem's outcome for that run is known
+    (T2 phase 3a). Returns True only when the stored label actually changed.
+
+    The outcome is authoritative for the ``delivery`` bucket only:
+      * send failed   -> ``unknown`` becomes ``delivery`` (the ping is the salient fact);
+        an already-classified root cause (rate_limit/auth/...) is kept — it names why the
+        run died, and the send failure is still visible on the job/ledger side;
+      * send succeeded -> a stored ``delivery`` label is re-derived from the stored error
+        text WITHOUT delivery keywords, so a prose mention of ``deliver`` can no longer
+        hold the bucket (the measured T-2 mislabel);
+      * any other stored bucket with a successful send is left alone.
+    Best-effort by contract: callers wrap it so a ledger hiccup never breaks delivery.
+    """
+    if not incident_id:
+        return False
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT error, failure_type FROM cron_incidents WHERE id=?", (incident_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        stored = row["failure_type"]
+        if stored == "delivery":
+            target = "delivery" if delivery_failed else _classify_failure_type(row["error"])
+        elif delivery_failed and stored == "unknown":
+            target = "delivery"
+        else:
+            return False
+        if target == stored:
+            return False
+        conn.execute(
+            "UPDATE cron_incidents SET failure_type=? WHERE id=?", (target, incident_id)
+        )
+        return True
+
+
+def close_incidents_for_deleted_job(job_id: str) -> int:
+    """Close the job's OPEN incidents when its job record is deleted (T2 phase 3b).
+
+    A deleted job can never run again, so its ``detected``/``alerted`` incidents can never
+    auto-resolve (the recovery hook only fires on a successful run) and would sit in
+    ``hermes cron incidents`` as "open" forever. Deletion IS an operator decision, so the
+    rows go terminal (``closed`` + acked) instead of ``resolved``, which is the re-openable
+    "job recovered" state. Returns how many rows were closed.
+    """
+    job_id = str(job_id or "")
+    if not job_id:
+        return 0
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE cron_incidents
+               SET state='closed', closed_at=?, acked_at=COALESCE(acked_at, ?)
+               WHERE job_id=? AND state IN ('detected','alerted')""",
+            (now, now, job_id),
+        )
+        return cur.rowcount
 
 
 def set_incident_state(incident_id: str, state: str) -> bool:

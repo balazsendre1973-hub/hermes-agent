@@ -18,6 +18,7 @@ _KIND_LABELS = {
     "wrong_store": "rows in another profile's store",
     "legacy_main": "legacy agent:main rows inside a named profile's store",
     "unclaimed_namespace": "rows keyed to a profile that does not exist",
+    "orphan_receipt": "LOCAL creation receipts whose profile_id names another profile",
     "crossed_parent": "parent_session_id crossing profile namespaces",
     "routing_stray": "routing rows outside the default store",
     "routing_unclaimed": "routing rows for a profile that does not exist",
@@ -50,6 +51,7 @@ def cmd_repair_profiles(args) -> int:
     apply = bool(getattr(args, "apply", False))
     as_json = bool(getattr(args, "json", False))
     legacy_main = getattr(args, "legacy_main", None) or "report"
+    orphan_receipts = getattr(args, "orphan_receipts", None) or "retire"
 
     if apply:
         # Before any store is opened for write: a writable open runs schema init, and a live
@@ -62,7 +64,8 @@ def cmd_repair_profiles(args) -> int:
                   file=sys.stderr)
             return 1
 
-    plan, session = scan_stores(stores, legacy_main=legacy_main, read_only=not apply)
+    plan, session = scan_stores(stores, legacy_main=legacy_main, orphan_receipts=orphan_receipts,
+                                read_only=not apply)
     try:
         findings = plan.findings
         repairable = plan.repairable

@@ -32,6 +32,17 @@ class RuntimeStoreError(ValueError):
         super().__init__(reason)
 
 
+#: The largest serialized ``worker.persist`` payload one receipt may carry. It MUST agree with
+#: the worker's outbox journal cap (``RuntimeSessionStore.__init__``'s ``max_bytes``, default
+#: 32 MiB): a journal entry that fits locally is then sent verbatim as the receipt payload, so a
+#: smaller owner-side cap turns every large-but-legitimate commit into ``invalid_params`` —
+#: which is what killed the 2026-11-07 22:44 worker (session local-5bbfe397, t_7c9736bb
+#: attempt-2). Measured production size: a 4.28 MB transcript archive (run 1089, session
+#: local-94ac465e), whose ``compression.archive`` payload carries the pruned handoff rows AND
+#: the unpruned edges as ``held_for_cas``. Only the digest and the handler result are stored
+#: (``worker_receipts``), so a larger payload costs nothing durable on this side.
+WORKER_PERSIST_MAX_PAYLOAD_BYTES = 32 * 1024 * 1024
+
 #: The one ``admission_conflict`` that proves the request was already admitted: this principal's
 #: request id on this target holds an admission with another payload. Every other conflict (route,
 #: binding, lineage) carries no such proof, so a client tells them apart by this field.
@@ -157,6 +168,13 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
         if old is not None:
             if old['payload_digest'] != digest:
                 raise RuntimeStoreError('admission_conflict', **ADMITTED_REQUEST_CONFLICT)
+            # If the admission was fenced 'unknown' by a gateway restart (recover_session_inputs),
+            # but the same request_id is retrying (worker is alive), restore it to 'queued'
+            # so the worker can continue instead of hitting "Kanban execution unknown".
+            if old['status'] == 'unknown':
+                conn.execute('''UPDATE session_admissions SET status='queued' WHERE admission_id=?''', (old['admission_id'],))
+                # Re-fetch to return the updated row
+                old = conn.execute('SELECT * FROM session_admissions WHERE admission_id=?', (old['admission_id'],)).fetchone()
             if _replay_guard is not None:
                 _replay_guard(conn)
             return _row(old)
@@ -963,7 +981,7 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
     if type(sequence) is not int or sequence < 1 or not isinstance(operation, str) or operation not in handlers:
         raise RuntimeStoreError('invalid_params')
     encoded = _json(payload)
-    if len(encoded.encode('utf-8', errors='surrogatepass')) > 4 * 1024 * 1024:
+    if len(encoded.encode('utf-8', errors='surrogatepass')) > WORKER_PERSIST_MAX_PAYLOAD_BYTES:
         raise RuntimeStoreError('invalid_params')
     digest = admission_fingerprint(canonical_target=session_id,
                                   payload={'operation': operation, 'payload': json.loads(encoded)})

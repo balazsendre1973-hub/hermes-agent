@@ -79,7 +79,7 @@ class HostedRoomAuthorityRPC:
     async def _create(self, params):
         if self.authority.db.get_session(self.ref.session_id) is not None:
             return await self._resume(params)
-        from gateway.run import _load_gateway_config, _resolve_gateway_model
+        from gateway.run import ModelResolutionError, _load_gateway_config, _resolve_gateway_model
         from gateway.session_policy import build_policy
         from gateway.session_local import stage_local_session
         from gateway.session_local_recovery import restore_local_session
@@ -95,8 +95,12 @@ class HostedRoomAuthorityRPC:
         agent['disabled_toolsets'] = sorted(
             set(parse_config_string_list(agent.get('disabled_toolsets'))) | {'clarify'})
         policy = build_policy({'source': 'gui'}, {**config, 'agent': agent}, private_secrets=private)
+        try:
+            resolved_model = _resolve_gateway_model(policy.config())
+        except ModelResolutionError:
+            resolved_model = policy.model
         policy = replace(policy, source='bot_room', platform='bot_room',
-                         model=policy.model or _resolve_gateway_model(policy.config()),
+                         model=resolved_model or policy.model,
                          toolsets=tuple(sorted(set(policy.toolsets) | {'bot_room'})))
         staged = stage_local_session(self.authority, self.principal, {'request_id': self.creation_id},
                                      trusted_policy=policy, trusted_secrets=private)
@@ -248,6 +252,10 @@ class HostedRoomAuthorityRPC:
                   'task_id': current[1].task_id if current else None,
                   'execution_generation': current[2] if current else None,
                   'status': current[0]['status'] if current else 'idle'}
+        live = self.authority.sessions.get(self.ref.session_id)
+        if current is not None and current[0]['status'] == 'started' and live is not None:
+            # The member's current tool and last frame, for the room's "scout · terminal · 7s".
+            result.update(live.event_stream.progress_for(current[0]['generation']))
         snapshot = await self.authority.attach(self.principal, self.ref, history=False)  # prompts only
         if snapshot.prompts:
             prompt = next((p for p in snapshot.prompts if p.get('kind') == 'approval'), None)

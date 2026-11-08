@@ -107,12 +107,19 @@ def messaging_route_info(runner, live):
     """``model`` and the effort fields a messaging chat's next turn resolves, without building an agent
     or resolving credentials: session ``/model`` > ``channel_overrides`` > config.yaml, and the session
     ``/reasoning`` > per-model > global level (``_resolve_session_reasoning_config``)."""
-    from gateway.run import _load_gateway_config, _resolve_gateway_model
+    from gateway.run import ModelResolutionError, _load_gateway_config, _resolve_gateway_model
     from gateway.session_local import effort_fields
     config = _load_gateway_config()
     block = config.get('model')
     block = block if isinstance(block, dict) else {}
-    model, provider, base_url = _resolve_gateway_model(config), block.get('provider'), block.get('base_url')
+    model: str = ""
+    provider: str = block.get('provider') or ""
+    base_url: str = block.get('base_url') or ""
+    try:
+        model, provider, base_url = _resolve_gateway_model(config), block.get('provider'), block.get('base_url')
+    except ModelResolutionError:
+        # Display path: degrade gracefully instead of crashing a viewer repaint.
+        pass
     channel = runner._channel_override_for(live.source)
     if channel is not None:
         model, provider = channel.model or model, channel.provider or provider

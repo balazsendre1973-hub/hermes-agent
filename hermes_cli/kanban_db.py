@@ -1001,6 +1001,15 @@ def _write_gate_triggers_sql() -> str:
     same constants the Python checklist reads (``VALID_STATUSES`` /
     ``VALID_BLOCK_KINDS``), so the two layers cannot drift.
 
+    Triggers are emitted as ``DROP TRIGGER IF EXISTS`` + ``CREATE TRIGGER``
+    (not ``CREATE TRIGGER IF NOT EXISTS``): ``IF NOT EXISTS`` never replaces
+    a stale trigger, so a status added to ``VALID_STATUSES`` after a board was
+    initialized (``revoked-by-Fin`` was added exactly this way) stayed absent
+    from the gate and every direct write of it hit ``SQLITE_CONSTRAINT 19``.
+    ``VALID_STATUSES`` is now the single maintenance point: every (re)init
+    rebuilds the triggers from it, and :func:`validate_write_gate_triggers`
+    flags any residual drift (hand-altered trigger, stale board).
+
     Only INSERT and UPDATE-of-the-column are gated: existing rows are never
     rewritten, so a pre-existing oddity can neither wedge reads nor block an
     unrelated column update — it only refuses to become a NEW illegal value.
@@ -1010,25 +1019,29 @@ def _write_gate_triggers_sql() -> str:
     status_msg = "kanban write-gate: illegal tasks.status"
     kind_msg = "kanban write-gate: illegal tasks.block_kind"
     return (
-        "\nCREATE TRIGGER IF NOT EXISTS trg_tasks_status_gate_insert\n"
+        "\nDROP TRIGGER IF EXISTS trg_tasks_status_gate_insert;\n"
+        "CREATE TRIGGER trg_tasks_status_gate_insert\n"
         "BEFORE INSERT ON tasks\n"
         f"WHEN NEW.status IS NULL OR NEW.status NOT IN ({statuses})\n"
         "BEGIN\n"
         f"    SELECT RAISE(ABORT, '{status_msg}');\n"
         "END;\n"
-        "\nCREATE TRIGGER IF NOT EXISTS trg_tasks_status_gate_update\n"
+        "\nDROP TRIGGER IF EXISTS trg_tasks_status_gate_update;\n"
+        "CREATE TRIGGER trg_tasks_status_gate_update\n"
         "BEFORE UPDATE OF status ON tasks\n"
         f"WHEN NEW.status IS NULL OR NEW.status NOT IN ({statuses})\n"
         "BEGIN\n"
         f"    SELECT RAISE(ABORT, '{status_msg}');\n"
         "END;\n"
-        "\nCREATE TRIGGER IF NOT EXISTS trg_tasks_block_kind_gate_insert\n"
+        "\nDROP TRIGGER IF EXISTS trg_tasks_block_kind_gate_insert;\n"
+        "CREATE TRIGGER trg_tasks_block_kind_gate_insert\n"
         "BEFORE INSERT ON tasks\n"
         f"WHEN NEW.block_kind IS NOT NULL AND NEW.block_kind NOT IN ({block_kinds})\n"
         "BEGIN\n"
         f"    SELECT RAISE(ABORT, '{kind_msg}');\n"
         "END;\n"
-        "\nCREATE TRIGGER IF NOT EXISTS trg_tasks_block_kind_gate_update\n"
+        "\nDROP TRIGGER IF EXISTS trg_tasks_block_kind_gate_update;\n"
+        "CREATE TRIGGER trg_tasks_block_kind_gate_update\n"
         "BEFORE UPDATE OF block_kind ON tasks\n"
         f"WHEN NEW.block_kind IS NOT NULL AND NEW.block_kind NOT IN ({block_kinds})\n"
         "BEGIN\n"
@@ -1041,6 +1054,50 @@ TRIGGER_SQL = _write_gate_triggers_sql()
 # SCHEMA_SQL is re-run on every process's first connect, so the triggers are
 # (re)created idempotently alongside the tables/indexes.
 SCHEMA_SQL = SCHEMA_SQL + TRIGGER_SQL
+
+
+def _trigger_not_in_statuses(trigger_sql: str) -> Optional[set[str]]:
+    """The statuses named in a status-gate trigger's ``NOT IN (...)`` clause,
+    or ``None`` when the trigger has no such clause or is missing.
+    """
+    match = re.search(r"NOT\s+IN\s*\(([^)]*)\)", trigger_sql or "", re.IGNORECASE)
+    if match is None:
+        return None
+    return {piece.strip().strip("'") for piece in match.group(1).split(",")}
+
+
+def validate_write_gate_triggers(conn: sqlite3.Connection) -> list[str]:
+    """Compare the installed status-gate triggers' allowed statuses with
+    ``VALID_STATUSES``.
+
+    Returns human-readable drift descriptions (empty = in sync). Trigger
+    bodies are generated from ``VALID_STATUSES`` in
+    :func:`_write_gate_triggers_sql` and re-created (DROP + CREATE) on every
+    init, so ``VALID_STATUSES`` is the single maintenance point; drift can only
+    come from a hand-altered trigger or an init that predates a status
+    addition. Callers log the gaps and keep the board open — the gate refusing
+    legal writes (``SQLITE_CONSTRAINT 19``) is already loud enough on its own,
+    init must not add a hard stop on top of it.
+    """
+    gaps: list[str] = []
+    for name in ("trg_tasks_status_gate_insert", "trg_tasks_status_gate_update"):
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+            (name,),
+        ).fetchone()
+        installed = _trigger_not_in_statuses(row[0]) if row is not None else None
+        expected = set(VALID_STATUSES)
+        if installed is None:
+            gaps.append(f"{name}: nincs telepítve, várt {sorted(expected)}")
+            continue
+        missing = sorted(expected - installed)
+        extra = sorted(installed - expected)
+        if missing or extra:
+            gaps.append(
+                f"{name}: NOT IN={sorted(installed)}, "
+                f"hiányzók={missing}, extra={extra}"
+            )
+    return gaps
 
 
 # --- ID generation ---
@@ -4391,15 +4448,16 @@ from hermes_cli.kanban_db_workspace import (
     _managed_scratch_path_info,
     _scratch_workspace,
 )
-from hermes_cli.kanban_bgproc import _defer_reclaim_for_live_worker, _worker_survived_termination
 from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     DispatchResult,
     _clear_failure_counter,
+    _defer_reclaim_for_live_worker,
     _pid_alive,
     _record_task_failure,
     _terminate_reclaimed_worker,
     _worker_alive,
+    _worker_survived_termination,
     _worker_terminal_timeout_env,
 )

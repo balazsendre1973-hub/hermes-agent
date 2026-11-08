@@ -2,6 +2,8 @@
 
 from unittest.mock import patch
 
+import pytest
+
 
 
 
@@ -74,7 +76,12 @@ class TestGatewayEmptyModelFallback:
 
 
 class TestResolveGatewayModel:
-    """Test _resolve_gateway_model reads model from config correctly."""
+    """Test _resolve_gateway_model reads model from config correctly.
+
+    Fail-closed: there is no longer a ``''`` return path. If the profile names no model and no
+    welcome trial is active, :exc:`ModelResolutionError` is raised (``t_605d71ef``, ``t_f59435a5``,
+    ``t_2f00675a``).
+    """
 
     def test_returns_default_key(self):
         from gateway.run import _resolve_gateway_model
@@ -84,14 +91,39 @@ class TestResolveGatewayModel:
         from gateway.run import _resolve_gateway_model
         assert _resolve_gateway_model({"model": {"model": "gpt-5.4"}}) == "gpt-5.4"
 
-    def test_returns_empty_when_missing(self):
+    def test_raises_when_model_dict_missing_default(self):
+        from gateway.run import ModelResolutionError
         from gateway.run import _resolve_gateway_model
-        assert _resolve_gateway_model({"model": {}}) == ""
+        with pytest.raises(ModelResolutionError) as exc:
+            _resolve_gateway_model({"model": {}})
+        assert "no configured model and no welcome trial active" in str(exc.value)
 
-    def test_returns_empty_when_no_model_section(self):
+    def test_raises_when_no_model_section(self):
+        from gateway.run import ModelResolutionError
         from gateway.run import _resolve_gateway_model
-        assert _resolve_gateway_model({}) == ""
+        with pytest.raises(ModelResolutionError) as exc:
+            _resolve_gateway_model({})
+        assert "no configured model and no welcome trial active" in str(exc.value)
 
     def test_string_model_config(self):
         from gateway.run import _resolve_gateway_model
         assert _resolve_gateway_model({"model": "my-model"}) == "my-model"
+
+
+class TestTrialModelFailClosed:
+    """The fail-closed contract of :func:`hermes_cli.anon_auth.trial_model` (``t_2f00675a``)."""
+
+    def test_trial_model_raises_when_no_trial(self):
+        import hermes_cli.anon_auth as anon_auth
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(anon_auth, "free_inference_active", lambda: False)
+            with pytest.raises(anon_auth.TrialModelUnavailable) as exc:
+                anon_auth.trial_model()
+            assert "no configured model and no welcome trial active" in str(exc.value)
+
+    def test_trial_model_returns_guest_model_when_trial_active(self):
+        import hermes_cli.anon_auth as anon_auth
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr(anon_auth, "free_inference_active", lambda: True)
+            assert anon_auth.trial_model() == anon_auth.GUEST_MODEL
+            assert anon_auth.trial_model() == "nous/welcome"

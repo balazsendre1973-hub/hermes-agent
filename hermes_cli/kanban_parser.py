@@ -235,6 +235,10 @@ _SPECS = [
         _arg("--mine", action="store_true", help="Filter by $HERMES_PROFILE as assignee"),
         _arg("--assignee"),
         _arg("--status", choices=sorted(kb.VALID_STATUSES)),
+        _arg("--label", metavar="NAME",
+             help="Title-label view: 'ticket' lists only ticket-flow cards "
+                  "(title starts with 'ticket_id:'), '!ticket' hides them — keeps "
+                  "tickets separate from Fin's own cards"),
         _arg("--tenant"),
         _arg("--session",
              help="Filter by originating chat/agent session id (set on tasks created from inside an ACP loop)"),

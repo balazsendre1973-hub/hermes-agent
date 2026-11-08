@@ -1043,7 +1043,7 @@ class GatewaySlashCommandsMixin(
 
     async def _handle_footer_command(self, event: MessageEvent) -> str:
         """Handle /footer command — toggle the runtime-metadata footer."""
-        from gateway.run import _load_gateway_config, _resolve_gateway_model
+        from gateway.run import ModelResolutionError, _load_gateway_config, _resolve_gateway_model
         from gateway.runtime_footer import format_runtime_footer, resolve_footer_config
         config_path, platform_key = self._display_config_target(event)
         arg = event.get_command_args().strip().lower()
@@ -1073,9 +1073,13 @@ class GatewaySlashCommandsMixin(
             return t("gateway.config_save_failed", error=e)
         example = ""
         if new_state:
+            try:
+                preview_model = _resolve_gateway_model(user_config)
+            except ModelResolutionError:
+                preview_model = None
             # Show a preview using current agent state if available.
             preview = format_runtime_footer(
-                model=_resolve_gateway_model(user_config) or None, context_tokens=0, context_length=None,
+                model=preview_model or None, context_tokens=0, context_length=None,
                 fields=effective.get("fields") or ["model", "context_pct", "cwd"])
             if preview:
                 example = t("gateway.footer.example_line", preview=preview)

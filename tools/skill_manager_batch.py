@@ -91,7 +91,13 @@ def _validate_batch_ops(operations, default_name, tool_error):
         return None, tool_error(f"operations[{i}]{msg}", success=False)
     names = []
     for i, op in enumerate(operations):
-        if not isinstance(op, dict) or not op.get("action"):
+        if not isinstance(op, dict):
+            return fail(i,
+                " is not a batch-op object — every element must be "
+                "{\"action\": ..., \"name\": ...}. The whole 'operations' array looks like it "
+                "was passed as a JSON-encoded string instead of a native list of op objects; "
+                "pass a real array of objects.")
+        if not op.get("action"):
             return fail(i, " needs an 'action'.")
         act = op["action"]
         if act not in _BATCH_OP_ACTIONS:

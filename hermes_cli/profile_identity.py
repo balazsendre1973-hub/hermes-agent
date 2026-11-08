@@ -91,6 +91,10 @@ def _purge_profile_identity(canon: str, live_mux: bool) -> bool:
     Returns True when the identity was purged — by the gateway's control verb, or by this process's
     durable delete when no gateway holds the store — and False when a live gateway did not accept
     it. Never fatal to the delete, which has already happened by this point.
+
+    The durable delete settles every store that can hold the name: the root store, the profile's
+    own home, and every ``profiles/*/state.db`` — a directory moved before the tombstone holds the
+    dead name's rows under a directory name that no longer matches the purged profile.
     """
     if live_mux:
         from hermes_constants import get_default_hermes_root
@@ -114,14 +118,26 @@ def _purge_profile_identity(canon: str, live_mux: bool) -> bool:
             file=sys.stderr)
         return False
 
-    from hermes_cli.profiles import get_profile_dir
+    from hermes_cli.profiles import _get_profiles_root, get_profile_dir
     from hermes_constants import get_default_hermes_root
     from hermes_state_registry import acquire, release_or_close
     root = get_default_hermes_root()
+    # The profile's own home is not the only store that can hold its identity: a directory moved
+    # before the tombstone (rename writerchan -> logchan) leaves get_profile_dir(canon) missing
+    # while the dead name's rows sit in the moved directory's store — the old two-store loop
+    # skipped that store and the rows survived the delete. Scan every profiles/*/state.db too;
+    # matching happens inside purge_profile_state (by name/namespace, and by home path for
+    # receipts), so a store with nothing for this profile is a no-op. Tombstone stores under
+    # profiles/.deleted/ are deliberately not scanned: nothing loads them again.
+    db_paths = [root / "state.db", get_profile_dir(canon) / "state.db"]
+    with contextlib.suppress(OSError):
+        db_paths.extend(sorted(_get_profiles_root().glob("*/state.db")))
     purged = True
-    for db_path in (root / "state.db", get_profile_dir(canon) / "state.db"):
-        if not db_path.exists():
+    seen: set[Path] = set()
+    for db_path in db_paths:
+        if db_path in seen or not db_path.is_file():
             continue
+        seen.add(db_path)
         db = None
         try:
             db = acquire(db_path)
@@ -237,3 +253,19 @@ def _migrate_profile_identity(old_canon: str, new_canon: str, live_mux: bool) ->
                 with contextlib.suppress(Exception):
                     release_or_close(db)
     return migrated
+
+
+def _record_profile_rename(new_dir: Path, old_canon: str) -> None:
+    """Append ``old_canon`` to the renamed profile's ``previous_names`` history.
+    Best-effort: never raises, so a metadata write failure cannot fail the rename.
+
+    Only reached for a real slug change — ``rename_profile`` returns early for the
+    default profile (display-name only) and refuses ``old == new`` (target exists)."""
+    from hermes_cli import profiles as _profiles
+    try:
+        history = _profiles.read_profile_meta(new_dir).get("previous_names") or []
+        if old_canon not in history:
+            history = [*history, old_canon]
+        _profiles.write_profile_meta(new_dir, previous_names=history)
+    except Exception as exc:  # unwritable / corrupt profile.yaml — history is advisory
+        _profiles.logger.debug("profile rename: could not record previous name %r in %s: %s", old_canon, new_dir, exc)

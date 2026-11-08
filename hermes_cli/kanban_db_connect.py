@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import threading
 import time
+import logging
 from dataclasses import dataclass
 from dataclasses import field
 from agent.deadline import poll_until
@@ -781,6 +782,12 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
                 # (DROP TABLE drops its triggers); re-assert them so the
                 # SQL-level gate cannot silently vanish on a drifted board.
                 conn.executescript(_kb.TRIGGER_SQL)
+                # Surface drift between the installed triggers and VALID_STATUSES
+                # (e.g. a trigger created before ``revoked-by-Fin`` was added):
+                # VALID_STATUSES is the single maintenance point, triggers follow
+                # it at every init; log instead of raising so a board still opens.
+                for gap in _kb.validate_write_gate_triggers(conn):
+                    logging.getLogger(__name__).warning("kanban write-gate trigger drift: %s", gap)
                 _INITIALIZED_PATHS.add(resolved)
 
         conn, _ = _open_configured(path, _init_if_needed)

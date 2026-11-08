@@ -15,7 +15,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from gateway.kanban_watchers_common import _board_slugs, _positive_int_setting, logger
+from gateway.kanban_watchers_common import (
+    _board_slugs,
+    _positive_int_setting,
+    logger,
+    parked_board_slugs,
+)
 
 
 def _kbc():
@@ -129,13 +134,32 @@ class _KanbanDispatcher:
 
     CORRUPT_BOARD_RETRY_AFTER_SECONDS = 300
 
-    def __init__(self, kb: Any, settings: _DispatcherSettings) -> None:
+    def __init__(self, kb: Any, settings: _DispatcherSettings,
+                 kanban_cfg: dict | None = None) -> None:
         self.kb = kb
         self.settings = settings
+        self._board_status_cfg = kanban_cfg or {}
+        # Parked slugs from the previous tick — logged state changes only,
+        # so an idle gateway stays silent.
+        self._last_parked: set[str] = set()
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
 
     def _board_slugs(self) -> list:
-        return _board_slugs(self.kb)
+        """All live boards minus the `board_status.json` `parked` list.
+
+        Parked boards keep their card statuses (ready/running/…) — they are
+        simply never dispatched. The list is re-read every tick; the skip log
+        fires only on a state change.
+        """
+        all_slugs = _board_slugs(self.kb)
+        parked = parked_board_slugs(self._board_status_cfg)
+        live = set(all_slugs)
+        for slug in sorted((parked - self._last_parked) & live):
+            logger.info("kanban dispatcher: board %s is parked; skipping", slug)
+        for slug in sorted((self._last_parked - parked) & live):
+            logger.info("kanban dispatcher: board %s is active again; resuming dispatch", slug)
+        self._last_parked = parked
+        return [slug for slug in all_slugs if slug not in parked]
 
     def board_db_fingerprint(self, slug: str) -> tuple[str, int | None, int | None]:
         from hermes_cli import kanban_db as _kb

@@ -13,6 +13,12 @@ import sqlite3
 from argparse import Namespace
 from pathlib import Path
 
+# Boot the entry-point module at collection time, while no per-test home-I/O guard is armed yet:
+# ``SessionDB.append_message`` on a user row lazily imports ``agent.conversation_loop`` →
+# ``hermes_bootstrap``, whose module body probes ``<checkout>/../manifest.json`` — on an install
+# that checks the repo out inside the real home that probe is a guarded real-home read, so the
+# first test to append a message would fail with "TEST BUG: file I/O against the REAL hermes home".
+import hermes_bootstrap
 import pytest
 
 from hermes_state import SessionDB
