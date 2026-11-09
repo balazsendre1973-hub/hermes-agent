@@ -128,6 +128,47 @@ def _run_worker_pids(conn, task_row, task_id):
     return [(int(pid), fingerprint) for pid, fingerprint in recorded if pid]
 
 
+def _owner_run_is_over_on_board(conn, task_id) -> bool:
+    """True when the board records that the owner's attempt on this run ended.
+
+    Evidence is recorded on the run's board events or on the owner ledger that its receipt
+    names:
+      * ``worker_lost`` — the owner recorded losing its managed worker;
+      * a ``worker_result`` — the bound interpreter wrote a terminal verdict;
+      * the admission-side ``worker_executions`` row settled to ``terminal`` — the owner
+        closed the admission against a known generation.
+
+    Missing evidence means we cannot prove the attempt is over: ``False`` (pause holds).
+    """
+    # (1) The owner recorded the loss on the board.
+    lost = _latest_run_event(conn, task_id, 'worker_lost')
+    if lost:
+        return True
+    # (2) The bound interpreter wrote a terminal verdict.
+    result = _latest_run_event(conn, task_id, 'worker_result')
+    if result.get('exit_code') is not None:
+        return True
+    # (3) The owner ledger's admission-side worker execution is terminal.
+    receipt = _owner_receipt(conn, task_id)
+    if receipt:
+        try:
+            with closing(sqlite3.connect(Path(receipt['db']).as_uri() + '?mode=ro', uri=True)) as owner:
+                row = owner.execute(
+                    """SELECT we.status
+                       FROM worker_executions we
+                       JOIN session_admissions sa
+                         ON we.execution_id = 'admission-worker:' || sa.admission_id
+                       WHERE sa.target_session_id = ? AND sa.request_id = ?
+                       LIMIT 1""",
+                    (receipt['session_id'], receipt['request_id']),
+                ).fetchone()
+                if row is not None and row[0] == 'terminal':
+                    return True
+        except (OSError, KeyError, TypeError, ValueError, sqlite3.Error):
+            return False
+    return False
+
+
 def owner_attempt_provably_over(conn, task_id) -> bool:
     """True when an unresolved owner receipt cannot still be executing this attempt.
 
@@ -138,13 +179,16 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
     asks the question that matters — can anything still be executing this attempt? — from
     evidence the board already keeps:
 
-      * the run never bound an interpreter (a bound run is the crash sweep's to book);
+      * the run never bound an interpreter, or the interpreter it bound is dead and the
+        board records the attempt's end (a bound run is the crash sweep's only while its
+        interpreter is still alive);
       * every worker pid recorded for the run (``tasks.worker_pid``, its ``spawned`` and
         ``worker_bound`` events) is dead or recycled;
       * and the owner's own admission is SETTLED (``status='terminal'``) with at least one
         recorded pid, or the host-local claim has EXPIRED with no heartbeat inside
         ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` and the admission is settled or (pids
-        recorded) the owner's process is gone.
+        recorded) the owner's process is gone — or the owner itself recorded the attempt's
+        end on the board.
 
     A settled admission outranks the owner's liveness: the owner is usually the long-lived
     gateway, alive by design, and it settles a lost managed worker's admission without
@@ -157,7 +201,12 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_dispatch import _worker_alive
     if _latest_run_event(conn, task_id, 'worker_bound'):
-        return False  # a bound run is the crash sweep's to book (bound_interpreter_gone)
+        if not bound_interpreter_gone(conn, task_id):
+            return False  # a live bound interpreter — the attempt may still be executing
+        # A dead bound interpreter is no longer the crash sweep's exclusive domain.
+        # Only release its lapsed claim if the board records the attempt's end.
+        if not _owner_run_is_over_on_board(conn, task_id):
+            return False
     receipt = _owner_receipt(conn, task_id)
     if receipt is None:
         return False  # no receipt: this pause did not come from an owner attempt
@@ -180,8 +229,9 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
     heartbeat = kb._to_epoch(row['last_heartbeat_at'])
     if heartbeat is not None and now - heartbeat <= kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS:
         return False
-    # A lapsed claim: a settled admission is proof; an unsettled one needs recorded pids and a dead owner.
-    return settled or (bool(pids) and _owner_process_gone(receipt))
+    # A lapsed claim: a settled admission is proof; an unsettled one needs recorded pids and
+    # a dead owner — or the owner itself recorded the attempt's end on the board.
+    return settled or (bool(pids) and _owner_process_gone(receipt)) or _owner_run_is_over_on_board(conn, task_id)
 
 
 def owner_attempt_note(conn, task_id, lost=None) -> str:
@@ -246,12 +296,17 @@ def owner_reclaim_blocked(conn, task_id, *, crash_sweep=False) -> bool:
     """True when a reclaim path must leave this task alone.
 
     The pause protects the effects of an attempt that may still be in flight, and stops
-    holding the claim as soon as nothing can still be executing it. A run whose bound
-    interpreter is dead stays the crash sweep's alone (``crash_sweep=True``), so it is booked
-    ``crashed`` and re-queued once rather than ``reclaimed`` by whichever path ticks first. A
-    run that never bound one is released by any path once ``owner_attempt_provably_over``:
-    the shape that used to be unreclaimable forever, because ``bound_interpreter_gone`` was the
-    only override and it needs the ``worker_bound`` event that run never wrote.
+    holding the claim as soon as nothing can still be executing it. After ``A1`` (owner-fence
+    backstop), a run whose bound interpreter is dead is no longer the crash sweep's exclusive
+    domain: when the interpreter is gone and the board records the attempt's end (
+    ``worker_lost`` / terminal ``worker_result`` / terminal admission-side ``worker_executions``),
+    a lapsed claim is released by ``release_stale_claims`` — ``reclaimed`` outcome, breaker-tick,
+    requeue. The crash sweep still books ``crashed`` if it ticks first while the claim is still
+    valid (a fresh claim is untouched by ``release_stale_claims``); whichever path ticks first
+    wins. A run that never bound an interpreter is released by any path once
+    ``owner_attempt_provably_over``: the shape that used to be unreclaimable forever, because
+    ``bound_interpreter_gone`` was the only override and it needs the ``worker_bound`` event
+    that run never wrote.
     """
     if not owner_reclaim_paused(conn, task_id):
         return False

@@ -48,7 +48,7 @@ def setup_runner(tmp_path, monkeypatch):
 def completion(*, profile="yuki", metadata=None, chat="post", thread="post",
                user="creator", mode="notify+wake"):
     with kbc.connect() as conn:
-        task = kb.create_task(conn, title="route completion", assignee="default")
+        task = kb.create_task(conn, title="route completion", assignee="worker")
         kbn.add_notify_sub(conn, task_id=task, platform="discord", chat_id=chat,
                            thread_id=thread, chat_type="thread", user_id=user,
                            notifier_profile=profile, delivery_mode=mode,

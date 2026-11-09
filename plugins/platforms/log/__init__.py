@@ -182,10 +182,8 @@ def register(ctx) -> None:
         # Konvenció szerint a TELJES home-channel env változó neve (lásd BUZZ_HOME_CHANNEL,
         # DISCORD_HOME_CHANNEL): deliver=log (chat id nélkül) innen olvassa a célt.
         cron_deliver_env_var="LOG_HOME_CHANNEL",
-        standalone_sender_fn=log_standalone_send,
-        # No live adapter by design: cron delivery goes through standalone_sender_fn; the gateway
-        # startup must not flag this as adapter_unavailable/fatal (standalone-only platform).
         standalone_only=True,
+        standalone_sender_fn=log_standalone_send,
         emoji="\U0001f4c5",
         max_message_length=0,
         pii_safe=False,

@@ -146,8 +146,6 @@ def test_acceptance_runs_gh_as_the_assignee_profile(tmp_path, monkeypatch):
     assignee_home = launch_home / "profiles" / "b"
     assignee_home.mkdir(parents=True)
     (assignee_home / ".env").write_text("GH_TOKEN=b-token\n", encoding="utf-8")
-    # Profile identity marker for the write-gate's assignee registry check.
-    (assignee_home / "config.yaml").write_text("{}\n", encoding="utf-8")
     # Ambient residue that must NOT decide the login.
     monkeypatch.setenv("GH_TOKEN", "launch-token")
     monkeypatch.setenv("GH_CONFIG_DIR", "/nonexistent/launch/gh")
@@ -188,8 +186,6 @@ def test_assignee_without_own_gh_login_never_falls_through_to_ambient_login(tmp_
     assignee_home = launch_home / "profiles" / "b"
     assignee_home.mkdir(parents=True)
     (assignee_home / ".env").write_text("", encoding="utf-8")
-    # Profile identity marker for the write-gate's assignee registry check.
-    (assignee_home / "config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("GH_TOKEN", "launch-token")
     monkeypatch.setenv("GH_CONFIG_DIR", "/nonexistent/launch/gh")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "launch-xdg"))

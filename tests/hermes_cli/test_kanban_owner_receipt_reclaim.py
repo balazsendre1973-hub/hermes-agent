@@ -24,6 +24,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import psutil
@@ -225,6 +226,77 @@ def test_a_settled_admission_is_proof_even_while_the_owner_gateway_is_alive(boar
     # Booked against the breaker like any other non-completing attempt (A3).
     assert board.state("t_gateway")["consecutive_failures"] == 1
     assert board.state("t_bound")["status"] == "running"
+
+
+# --- the run-1300 wedge backstop ----------------------------------------------------------
+
+def test_a_dead_bound_interpreter_with_board_loss_is_reclaimed_by_stale_claims(board):
+    """Run-1300 wedge backstop: a dead bound interpreter whose owner recorded the loss on the
+    board releases its lapsed claim even while the owner (the long-lived gateway) stays alive.
+
+    Regression for the 'resurrected-admission mutual deferral' wedge (t_5cd17d21 / t_93eeae86):
+    ``owner_attempt_provably_over`` used to treat every ``worker_bound`` run as the crash
+    sweep's forever. Now a bound run is the crash sweep's only while its interpreter is alive;
+    a dead bound interpreter yields its claim once the board records the attempt's end
+    (`worker_lost`, or a terminal admission-side ``worker_executions`` row) and the claim has
+    lapsed.
+    """
+    board.dead_attempt("t_wedge", worker_bound=True, owner_pid=os.getpid(), owner_birth=None,
+                       admission=("unknown", None))  # owner closed the admission to unknown
+    # The owner recorded the loss on the board.
+    board.event("t_wedge", board.conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?", ("t_wedge",)).fetchone()[0],
+                "worker_lost", {"reason": "managed worker lost", "bound": True}, NOW + 90)
+    # Model the real owner ledger: the admission-side worker execution is terminal
+    # (lose_admission_worker also sets session_admissions.status = 'unknown').
+    with sqlite3.connect(board.ledger) as store:
+        store.execute("CREATE TABLE worker_executions ("
+                      "execution_id TEXT, session_id TEXT, kind TEXT, owner_epoch INTEGER, "
+                      "generation INTEGER, status TEXT, adoption_digest TEXT)")
+        store.execute("ALTER TABLE session_admissions ADD COLUMN admission_id TEXT")
+        adm_id = uuid.uuid4().hex
+        store.execute("UPDATE session_admissions SET admission_id = ? WHERE target_session_id = ?",
+                      (adm_id, "sess-1"))
+        store.execute("INSERT INTO worker_executions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                      ('admission-worker:' + adm_id, "sess-1", 'compute', 1, 1, 'terminal', 'deadbeef'))
+
+    assert owner_attempt_provably_over(board.conn, "t_wedge") is True
+    assert owner_reclaim_blocked(board.conn, "t_wedge") is False
+    # The crash sweep would also be allowed to book it — reclaim and sweep race, both are valid
+    # resolutions of the wedge; the platform's own reclaim path wins this one tick.
+    assert kb.release_stale_claims(board.conn) == 1
+    row = board.state("t_wedge")
+    assert row["status"] == "ready"
+    assert row["claim_lock"] is None
+    run = board.conn.execute("SELECT outcome, error FROM task_runs WHERE task_id = 't_wedge'").fetchone()
+    assert run[0] == "reclaimed"
+    assert "managed worker lost" in run[1]
+    # A claim released through the owner fence is booked as a non-success attempt.
+    assert board.state("t_wedge")["consecutive_failures"] == 1
+
+
+def test_a_terminal_admission_side_worker_execution_frees_the_claim_without_a_board_event(board):
+    """If the owner ledger settled its worker execution but the board event is missing, the
+    terminal ``worker_executions`` row (check 3) still proves the attempt over for a dead
+    bound interpreter on a lapsed claim."""
+    board.dead_attempt("t_fallback", worker_bound=True, owner_pid=os.getpid(), owner_birth=None,
+                       admission=("unknown", None))
+    # Only the ledger settlement, no ``worker_lost`` event on the board.
+    with sqlite3.connect(board.ledger) as store:
+        store.execute("CREATE TABLE worker_executions ("
+                      "execution_id TEXT, session_id TEXT, kind TEXT, owner_epoch INTEGER, "
+                      "generation INTEGER, status TEXT, adoption_digest TEXT)")
+        store.execute("ALTER TABLE session_admissions ADD COLUMN admission_id TEXT")
+        adm_id = uuid.uuid4().hex
+        store.execute("UPDATE session_admissions SET admission_id = ? WHERE target_session_id = ?",
+                      (adm_id, "sess-1"))
+        store.execute("INSERT INTO worker_executions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                      ('admission-worker:' + adm_id, "sess-1", 'compute', 1, 1, 'terminal', 'deadbeef'))
+
+    assert owner_attempt_provably_over(board.conn, "t_fallback") is True
+    assert owner_reclaim_blocked(board.conn, "t_fallback") is False
+    assert kb.release_stale_claims(board.conn) == 1
+    assert board.state("t_fallback")["status"] == "ready"
 
 
 # --- the gate is decided under the same write lock as the release ---------------------------

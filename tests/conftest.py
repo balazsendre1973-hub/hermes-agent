@@ -38,6 +38,12 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from hermes_agent.compat.finder import Finder as _CompatFinder
+from hermes_agent.compat.moves import MOVES as _COMPAT_MOVES
+
+# In-repo code must use current module names; an old name fails here instead of being aliased.
+sys.meta_path.insert(0, _CompatFinder(_COMPAT_MOVES, strict=True))
+
 # Every test file runs in its own process, and in a checkout without an install stamp
 # get_version_info() shells out to git 7 times (~0.55 s per process in a large local
 # clone; a whole local suite run spent ~48 CPU-minutes there). Seed the shape a shallow
@@ -150,15 +156,7 @@ for _key in SCRATCH_TMP_ENV_VARS:
         if any(_path.is_relative_to(_root) for _root in _guarded_tmp_roots):
             del os.environ[_key]
 tempfile.tempdir = None  # re-resolve after stripping guarded temp directories
-_default_tmp = tempfile.gettempdir()  # no-tmp: ok — reads the system default only to move off it
-# After a strip the fallback is the platform default: on Linux that is the RAM-backed tmpfs
-# system temp, where pytest basetemps and session sandboxes filled all 1048576 inodes on
-# 2026-11-06 (t_90002906). The pin below must stay (the import-time scratch hook is only a
-# no-op while a temp var is set), but pin the FHS disk-backed root instead of the tmpfs one.
-if os.name == "posix" and Path(_default_tmp).resolve() == Path("/tmp") and os.path.isdir("/var/tmp"):  # no-tmp: ok — the tmpfs default we are leaving
-    _default_tmp = "/var/tmp"  # no-tmp: ok — /var/tmp is disk-backed by FHS, never tmpfs
-os.environ.setdefault("TMPDIR", _default_tmp)
-tempfile.tempdir = None  # gettempdir() above re-cached the default; re-resolve via the pinned TMPDIR
+os.environ.setdefault("TMPDIR", tempfile.gettempdir())
 
 if _hermes_home_points_at_production(os.environ.get("HERMES_HOME", "")):
     _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")

@@ -23,10 +23,6 @@ def review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
     # kanban_request_review now rejects reviewers that are not installed profiles (#106163).
     (home / "profiles" / "reviewer").mkdir(parents=True)
     (home / "profiles" / "reviewer" / "config.yaml").write_text("{}\n")  # identity marker
-    # The write-gate (kanban_write_gate) validates the ASSIGNEE the same way:
-    # register the acting profile so the create below passes the gate.
-    (home / "profiles" / "builder").mkdir(parents=True)
-    (home / "profiles" / "builder" / "config.yaml").write_text("{}\n")  # identity marker
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     with kbc.connect() as conn:

@@ -151,8 +151,9 @@ def main():
                         assert frozen['policy']['model'] == 'frozen-model', frozen
                         private = json.loads(frozen['policy']['kanban_json'])
                         assert private['db'] == str(board_path.resolve()) and private['claim_lock'] == task.claim_lock
-                    # The attempt's interpreter and its spawned worker are both gone: an ordinary crash,
-                    # booked once and re-queued once (same as a killed one-shot worker), never duplicated.
+                    # The attempt's interpreter and its spawned worker are both gone and its claim has
+                    # lapsed: A1 opens the fence, so ``release_stale_claims`` reclaims it once —
+                    # 'reclaimed' + breaker-tick + requeue, never duplicated.
                     wait_for(lambda: all(p.poll() is not None for p in clients))
                     assert len(peer.requests) == 1, peer.requests  # the restart never replays the lost call
                     conn.execute('UPDATE tasks SET claim_expires=1,last_heartbeat_at=1,max_runtime_seconds=1 WHERE id=?', (tid,))
@@ -163,7 +164,7 @@ def main():
                     same = kb.get_task(conn, tid)
                     run = conn.execute('SELECT outcome FROM task_runs WHERE id=?', (task.current_run_id,)).fetchone()
                     # 'running' when the owner's own dispatcher already re-queued it onto a fresh run.
-                    assert same.status in {'ready', 'running'} and (same.consecutive_failures, run[0]) == (1, 'crashed'), (same, run[0])
+                    assert same.status in {'ready', 'running'} and (same.consecutive_failures, run[0]) == (1, 'reclaimed'), (same, run[0])
                     assert same.current_run_id != task.current_run_id or same.status == 'ready', same
                     dispatch.dispatch_once(conn, board='owned', max_spawn=0, stale_timeout_seconds=1)
                     assert kb.get_task(conn, tid).consecutive_failures == 1

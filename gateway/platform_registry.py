@@ -108,9 +108,9 @@ class PlatformEntry:
     # ``async (pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False)
     # -> {"success": True, "message_id": ...} | {"error": str}``.
     standalone_sender_fn: Optional[Callable[..., Awaitable[dict]]] = None
-    # True: the platform has no live adapter by design (its factory returns None); cron and other
-    # out-of-process delivery goes through ``standalone_sender_fn``. Startup must not flag such a
-    # platform as adapter_unavailable/fatal — it is served, just without a co-resident connection.
+    # True: the platform deliberately ships NO live adapter (e.g. ``log``). Delivery runs through
+    # its ``standalone_sender_fn`` out of process (cron ``deliver:<platform>``), so recovery must
+    # not stamp ``adapter_unavailable`` for it — there is nothing to heal.
     standalone_only: bool = False
     # Every inbound event is produced by the service the adapter authenticated to with its own
     # credential (an event bus, not a person), so user allowlists and pairing do not apply. Never
@@ -189,21 +189,6 @@ def core_ships_platform(name: str) -> bool:
     value = str(name or "").strip().lower()
     return value in {Platform[member].value for member in Platform._member_names_} or (
         value in Platform._scan_bundled_plugin_platforms()[0])
-
-
-def core_adapter_platform(name: str) -> bool:
-    """*name* is a **static** ``Platform`` member — a core-shipped adapter (telegram, discord, …),
-    unlike a bundled ``plugins/platforms/`` plugin platform, which ``core_ships_platform`` also
-    counts.
-
-    The distinction matters for flags that must not be claimed for somebody else's adapter:
-    ``standalone_only`` on a core name would re-point the startup verdict of a real adapter
-    (disabled, ``needs_attention=False``, no reconnect retry) to a plugin that has no live
-    connection. ``_member_names_`` only ever holds the enum's own members — the pseudo members
-    ``Platform._missing_`` adds for plugin platforms go into ``_member_map_``/``_value2member_map_``
-    instead — so this set stays static however late it is read."""
-    from gateway.config import Platform
-    return str(name or "").strip().lower() in {Platform[member].value for member in Platform._member_names_}
 
 
 class PlatformRegistry:

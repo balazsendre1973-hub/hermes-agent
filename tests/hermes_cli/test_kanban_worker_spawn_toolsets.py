@@ -176,9 +176,6 @@ def test_worker_toolsets_come_from_the_assignee_profile_not_the_parent_config(tm
 
     profile = tmp_path / "profiles" / "elias"
     profile.mkdir(parents=True)
-    # Profile identity marker: the write-gate validates the assignee against the
-    # on-disk registry (a config.yaml marks the directory as a profile).
-    (profile / "config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(profile))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))

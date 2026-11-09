@@ -26,7 +26,6 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
-from hermes_cli import kanban_bgproc as _bgproc
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -35,11 +34,7 @@ if TYPE_CHECKING:
 
 # After this many consecutive non-success attempts on a task/profile the
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
-# (t_55e6fd81, layer (b): 2 → 3 — the stability report measured config-error
-# retries burning the budget on cards whose worker never ran; transients such as
-# gateway-drain owner refusals never reach this counter at all
-# (``_is_owner_drain_refusal`` books them ``infrastructure``).)
-DEFAULT_FAILURE_LIMIT = 3
+DEFAULT_FAILURE_LIMIT = 2
 
 # Keep a little wall-clock budget for the worker to observe a terminal timeout
 # and make a terminal board call (kanban_block/kanban_complete/kanban_request_review)
@@ -135,14 +130,6 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
-    preflight_blocked: list[tuple[str, str]] = field(default_factory=list)
-    """``(task_id, reason)`` parked ``blocked`` by
-    :func:`hermes_cli.kanban_preflight.preflight_task` BEFORE the worker was
-    spawned — a config error (unknown model, missing credential, unloadable
-    skill, unresolvable script) surfaced as an operator-actionable block
-    instead of a ``gave_up`` on a worker that never ran. Never counted as a
-    failure (``block_task`` leaves ``consecutive_failures`` alone), so these
-    ids are also mirrored into ``auto_blocked`` for the existing telemetry."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -567,6 +554,54 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
         reaped.append(row["task_id"])
 
 
+def _worker_survived_termination(termination: dict) -> bool:
+    """True when we tried to kill our own host-local worker and it is still alive.
+
+    Reclaiming then would release the claim and spawn a second worker while the
+    first still runs — the duplication loop. Only host-local workers we actually
+    signalled count; a non-local lock or no-op attempt (no ``os.kill``) must fall
+    through to the normal release path since we cannot manage that worker anyway.
+    """
+    return bool(
+        termination.get("host_local")
+        and (termination.get("termination_attempted") or termination.get("signal_refused"))
+        and not termination.get("terminated")
+    )
+
+
+def _defer_reclaim_for_live_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    claim_lock: Optional[str],
+    now: int,
+    termination: dict,
+    *,
+    reason: str,
+) -> None:
+    """Hold a claim whose worker survived termination instead of releasing it.
+
+    Extends ``claim_expires`` by ``RECLAIM_DEFER_GRACE_SECONDS`` so the task
+    stays ``running`` (no duplicate spawn) and records ``reclaim_deferred``.
+    The next tick retries the kill; not spawning a duplicate is what lets the
+    throttled worker finally die.
+    """
+    grace = now + _kb.RECLAIM_DEFER_GRACE_SECONDS
+    with _kb.write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET claim_expires = ? "
+            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
+            (grace, task_id, claim_lock),
+        )
+        if cur.rowcount != 1:
+            return
+        run_id = _kb._current_run_id(conn, task_id)
+        if run_id is not None:
+            conn.execute("UPDATE task_runs SET claim_expires = ? WHERE id = ?", (grace, run_id))
+        payload = {"reason": reason, "claim_lock": claim_lock, "claim_expires_now": grace}
+        payload.update(termination)
+        _kb._append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+
+
 def heartbeat_worker(
     conn: sqlite3.Connection,
     task_id: str,
@@ -664,10 +699,6 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 killed = _sigkill(kill, pid)
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
-        # t_639b6d1d: a live child outlives the worker just killed — park
-        # `blocked (transient)` instead of requeueing a twin beside it.
-        if _bgproc.park_for_live_background(conn, tid, stage="timed_out", exclude_pid=pid):
-            continue
         with _kb.write_txn(conn):
             # Again under the write lock, after the kill wait: an interpreter that bound
             # meanwhile is invisible to the pid/claim CAS below. Host-local by the filter above.
@@ -770,8 +801,8 @@ def detect_stale_running(
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
-        if _bgproc._worker_survived_termination(termination):
-            _bgproc._defer_reclaim_for_live_worker(
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
                 conn, tid, lock, now, termination,
                 reason="heartbeat_stale_worker_alive",
             )
@@ -1004,85 +1035,6 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
     return " ".join(lines)[-400:]
 
 
-# Owner-handshake refusals the WORKER prints on stderr before it exits 1
-# (``hermes_cli/kanban_worker_client._submit`` → ``Kanban owner refused: {exc}``).
-# ``_submit`` prints that prefix for EVERY refusal it catches, drain or not, so the
-# prefix alone proves nothing: a FINAL owner answer (a body rejection, an unauthorized
-# claim, ``Gateway disconnected; turn outcome is unknown``) reaches the board the same
-# way and those are card failures that must keep counting.
-_REFUSAL_MARKER = "Kanban owner refused:"
-# The worker gave the owner ``OWNER_WAIT_S`` and never got an answer: ``_await_receipt``
-# only raises this for a ``_restartable`` exception, so the detail is always a
-# transient host/transport condition, never the card's own work.
-_SILENCE_MARKER = "Kanban owner silent for"
-# Printed exactly once per worker process, at admission (``_await_receipt``). The
-# per-task log is APPEND-ONLY across attempts, so this is the boundary that tells the
-# final attempt's words from an earlier attempt's refusal still sitting in the window.
-_ADMISSION_SESSION_MARKER = "Session: "
-# Details that name the HOST rather than the card: the gateway draining for a
-# restart/update (``Gateway draining`` / ``restart_wait``) plus the runtime's own
-# transient reason codes (``runtime_draining`` / ``runtime_retired`` — the same set as
-# ``_TRANSIENT_RPC_REASONS`` in kanban_worker_client; the 2026-11-01 runtime drain
-# tripped the breaker on three healthy cards the same way the 2026-11-06 update drain
-# did).
-_DRAIN_MARKERS = ("Gateway draining", "restart_wait", "runtime_draining", "runtime_retired")
-
-
-def _is_owner_drain_refusal(worker_output: str) -> bool:
-    """True when a dead worker's own last words are a host-side owner-handshake refusal.
-
-    The signature, as observed while ``hermes update`` drained the gateway (2026-11-06,
-    board ``btcusd-jev``, card ``t_6391481f``: 4 worker spawns killed, 2 false
-    ``gave_up``/``blocked``, 1 false stall card, zero faults in the card's own work)::
-
-        Kanban owner refused: Kanban owner silent for 192s: Gateway draining: restart_wait
-
-    Two forms qualify:
-
-    1. an owner refusal whose detail names the drain (``Gateway draining``,
-       ``restart_wait``, ``runtime_draining``/``runtime_retired``), or
-    2. the ``Kanban owner silent for Ns`` timeout of that handshake — only ever raised
-       for a restartable host/transport exception, so silence itself is the diagnosis.
-
-    The worker exits 1 at the handshake, so NOTHING of the card ran and the exit is
-    host infrastructure — exactly like the spawn refusal (#114720): record it, do not
-    increment ``consecutive_failures``, do not trip the breaker.
-
-    Deliberately narrow. A plain nonzero exit, a traceback, or a refusal whose detail
-    does not name the host keeps counting, because only these forms prove the HOST ended
-    the attempt rather than the card. Arbitrary failures are never exempted.
-
-    The signature must also belong to the FINAL attempt: the per-task log is
-    append-only, so an earlier attempt's refusal can still sit in the 400-char window
-    read here, and a later attempt that crashed for its own reasons must not inherit
-    that exemption (seen twice in real history: a provider-404 crash whose window still
-    opened with a stale drain refusal). Every worker prints exactly one ``Session:``
-    line at admission, so the refusal only counts when it starts after the last one.
-    The one shape the log cannot disambiguate is a worker that printed NOTHING after
-    such an attempt (killed before admission): its window holds only the old words, so
-    it inherits the exemption once — until its own output pushes the stale line out.
-    """
-    if not worker_output:
-        return False
-    positions = [
-        pos for pos in (
-            worker_output.rfind(_REFUSAL_MARKER),
-            worker_output.rfind(_SILENCE_MARKER),
-        )
-        if pos >= 0
-    ]
-    if not positions:
-        return False
-    pos = max(positions)
-    if worker_output.rfind(_ADMISSION_SESSION_MARKER) >= pos:
-        # A later attempt's admission line follows: the refusal is not the last
-        # attempt's, so whatever killed THIS worker is still what counts.
-        return False
-    if worker_output.startswith(_SILENCE_MARKER, pos):
-        return True
-    return any(marker in worker_output[pos:] for marker in _DRAIN_MARKERS)
-
-
 @dataclass
 class _DeadWorker:
     """How ``detect_crashed_workers`` should book one dead worker."""
@@ -1097,11 +1049,6 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
-    infrastructure: bool = False
-    """The worker died at the OWNER HANDSHAKE while the gateway was draining: host
-    infrastructure, the card never ran. Booked with ``infrastructure: true`` and never
-    charged to ``consecutive_failures`` — the same non-counting treatment the spawn
-    refusal already gets (#114720). Only the drain/owner-refusal signature sets this."""
 
     @property
     def run_outcome(self) -> str:
@@ -1126,13 +1073,6 @@ def _classify_dead_worker(
         if worker_output:
             dead.error_text += f"{WORKER_OUTPUT_SEP}{worker_output!r}"
             dead.event_payload["worker_output"] = worker_output
-            if _is_owner_drain_refusal(worker_output):
-                # Tag it here, where the worker's own words are folded in: the run
-                # metadata (``_end_run``) and the ``crashed`` event both copy this
-                # payload, and ``_account_crashes`` reads the flag to leave the
-                # breaker alone.
-                dead.infrastructure = True
-                dead.event_payload["infrastructure"] = True
     return dead
 
 
@@ -1224,9 +1164,6 @@ class _CrashSweep:
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
-    # t_639b6d1d: detection runs under the reclaim txn, the park after it —
-    # ``block_task`` opens its own write transaction and nesting is refused.
-    parked: list[tuple[str, int]] = []
     with _kb.write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
@@ -1239,16 +1176,13 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
                 continue
-            # Launch-window grace so a freshly-spawned worker isn't reclaimed
-            # before its PID is visible on /proc.
             started_at = _kb._to_epoch(_kb._row_get(row, "started_at"))
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
                 continue
-            # An ambiguous receipt holds the card while the attempt may still run; once nothing
-            # can be executing it (a dead bound interpreter, or a run that never bound one): crash.
-            if owner_reclaim_blocked(conn, row["id"], crash_sweep=True):
+            blocked = owner_reclaim_blocked(conn, row["id"], crash_sweep=True)
+            if blocked:
                 continue
 
             pid = int(row["worker_pid"])
@@ -1256,11 +1190,6 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
             apply_attempt_note(conn, row["id"], pid, dead)
-            # t_639b6d1d: the worker is dead but a process it started is not —
-            # requeueing would run the same work twice (measured on t_8e9d4fd0).
-            if _bgproc.live_background_processes(conn, row["id"], exclude_pid=pid):
-                parked.append((row["id"], pid))
-                continue
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1304,10 +1233,6 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
-    # Parked outside the reclaim txn (see above): each card gets its own
-    # ``blocked (transient)`` + ``background_proc_alive`` event, not a crash.
-    for task_id, worker_pid in parked:
-        _bgproc.park_for_live_background(conn, task_id, stage="crashed", exclude_pid=worker_pid)
     return sweep
 
 
@@ -1372,35 +1297,20 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
             )
         else:
-            if dead.infrastructure:
-                # Host ended the attempt at the owner handshake (gateway draining):
-                # the card never ran, so the run is recorded but the breaker is not
-                # charged. The systemic/sticky treatment below is skipped too — a
-                # sticky hold would park the card for an operator on a host the
-                # operator is already restarting.
-                tripped = _record_task_failure(
-                    conn, tid,
-                    error=error_text,
-                    outcome="crashed",
-                    release_claim=False,
-                    end_run=False,
-                    infrastructure=True,
-                )
-            else:
-                is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
-                extra = {"pid": pid, "claimer": claimer}
-                if is_systemic:
-                    # Trips at 1, below any ``failure_limit``: hold it for an operator.
-                    extra["sticky"] = True
-                tripped = _record_task_failure(
-                    conn, tid,
-                    error=error_text,
-                    outcome="crashed",
-                    failure_limit=1 if is_systemic else None,
-                    release_claim=False,
-                    end_run=False,
-                    event_payload_extra=extra,
-                )
+            is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
+            extra = {"pid": pid, "claimer": claimer}
+            if is_systemic:
+                # Trips at 1, below any ``failure_limit``: hold it for an operator.
+                extra["sticky"] = True
+            tripped = _record_task_failure(
+                conn, tid,
+                error=error_text,
+                outcome="crashed",
+                failure_limit=1 if is_systemic else None,
+                release_claim=False,
+                end_run=False,
+                event_payload_extra=extra,
+            )
         if tripped:
             auto_blocked.append(tid)
     return auto_blocked
@@ -1480,12 +1390,10 @@ def _record_task_failure(
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips
     unconditionally (caller applied its own bounded-retry policy).
 
-    ``infrastructure=True``: the host ended the attempt before any of the card's
-    work ran — the spawn refusal (no restart-safe scope, #114720), or a worker that
-    died at the owner handshake while the gateway was draining (see
-    :func:`_is_owner_drain_refusal`). The run and event are recorded with
-    ``infrastructure: true`` but ``consecutive_failures`` is left alone, the status
-    column is never touched and the breaker never trips; the card stays retryable and
+    ``infrastructure=True``: the host refused the spawn (no restart-safe scope,
+    #114720) — nothing about the card ran, so the run and event are recorded
+    with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
+    the breaker never trips; the card stays retryable and
     :func:`check_respawn_guard` spaces the retries.
     """
     if failure_limit is None:
@@ -1644,16 +1552,11 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
-    park_live_proc: bool = False,
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
     Called per ready/review row before any claim attempt. Priority order:
-    ``"live_background_proc"`` (t_639b6d1d: a process this card's previous run
-    left behind is still alive, so the card is parked ``blocked (transient)``
-    here and no twin worker starts — only when the caller passes
-    ``park_live_proc``, because the read-only review-capacity probe must never
-    write), ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
+    ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
     refused — no restart-safe scope — within the cooldown; never counted),
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
@@ -1668,8 +1571,6 @@ def check_respawn_guard(
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
     """
-    if park_live_proc and _bgproc.park_for_live_background(conn, task_id, stage="spawn"):
-        return "live_background_proc"
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
         (task_id,),
@@ -2193,7 +2094,7 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
-    guard_reason = check_respawn_guard(conn, task_id, lane=lane, park_live_proc=not dry_run)
+    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
@@ -2222,54 +2123,6 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
-
-    # (b) stability layer — preflight BEFORE the worker exists. A config error
-    # (unknown `model_override`, missing provider credential, unloadable
-    # `skills` entry, unresolvable declared `script`) must surface as
-    # `blocked` + reason right here, never as a `gave_up` on a worker that
-    # never ran a line of the card's work. Fail-open by design: an internal
-    # preflight error never blocks a card.
-    try:
-        from hermes_cli import kanban_preflight
-
-        profile_home = None
-        if assignee:
-            try:
-                from hermes_cli.profiles import resolve_profile_env
-
-                profile_home = resolve_profile_env(assignee)
-            except Exception:
-                profile_home = None
-        scope = (
-            (lambda: _worker_profile_scope(profile_home, bind_home=True))
-            if profile_home
-            else None
-        )
-        preflight_kind, preflight_reason = kanban_preflight.preflight_task(
-            claimed, assignee=assignee, profile_home=profile_home,
-            scope_factory=scope,
-        )
-    except Exception:
-        preflight_kind, preflight_reason = None, None
-    if preflight_reason:
-        # `block_task` clears the claim, closes the run and appends the audit
-        # event — and never touches `consecutive_failures`, so a config error
-        # cannot exhaust the failure limit. Spawn nothing this tick either
-        # way; if the block itself failed (row changed under us) the claim TTL
-        # / stale detection recovers the card.
-        blocked = False
-        try:
-            blocked = bool(_kb.block_task(
-                conn, claimed.id, reason=preflight_reason,
-                kind=preflight_kind, expected_run_id=claimed.current_run_id,
-            ))
-        except Exception:
-            blocked = False
-        result.preflight_blocked.append((claimed.id, preflight_reason))
-        if blocked:
-            result.auto_blocked.append(claimed.id)
-        return False
-
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
