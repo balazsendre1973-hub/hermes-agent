@@ -84,6 +84,18 @@ def _reset_session_context_vars():
     _reset_all()
 
 
+@pytest.fixture(autouse=True)
+def _stab_1d_check_green(monkeypatch):
+    """Cron shutdown paths run with STAB-1D-CHECK green in tests.
+
+    pause_job/remove_job/cancel_job_run refuse live shutdown while
+    STAB_1D_CHECK is unset (fail-closed, the production default). The suite
+    exercises job lifecycle with CHECK green; production stays blocked until
+    the verifier (t_ee637aaa) signs STAB-1D-CHECK green.
+    """
+    monkeypatch.setenv("STAB_1D_CHECK", "1")
+
+
 def owner_execution_runner():
     """The production owner execution seam as a ``run_canonical_job`` replacement.
 
