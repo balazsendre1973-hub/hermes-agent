@@ -81,6 +81,7 @@ def test_pr_completion_requires_current_required_evidence(github):
         for conclusion in ("failure", "pending", "cancelled", "timed_out", "action_required", "neutral", "skipped", None, "success"):
             github.update(conclusion=conclusion, head="a" * 40)
             tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
+            assert kb.request_review(conn, tid, summary="publish the PR")
             ok = kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
             assert ok is (conclusion == "success")
             task = kb.get_task(conn, tid)
@@ -96,15 +97,18 @@ def test_pr_completion_requires_current_required_evidence(github):
             github.update(conclusion="success", head="a" * 40)
             github[fault] = True
             tid = kb.create_task(conn, title=fault, completion_contract="acme/repo")
+            assert kb.request_review(conn, tid, summary="publish the PR")
             assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
             assert kb.get_task(conn, tid).status != "done"
             github.pop(fault)
         # Omission and a sibling repository cannot downgrade the stored declaration.
         tid = kb.create_task(conn, title="publish", completion_contract="acme/repo")
+        assert kb.request_review(conn, tid, summary="publish the PR")
         assert not kb.complete_task(conn, tid, summary="local green")
         assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/other/repo/pull/7"})
         before = len(github["requests"])
         local = kb.create_task(conn, title="local", completion_contract="local-only")
+        assert kb.request_review(conn, local, summary="publish the PR")
         assert kb.complete_task(conn, local, summary="https://github.com/acme/repo/pull/7 is background context")
         assert len(github["requests"]) == before
 
@@ -122,7 +126,7 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
                     assert kb.unblock_task(rival, tid)
                     github["replacement"] = kb.claim_task(rival, tid).current_run_id
             github.update(conclusion=conclusion, race=reclaim)
-            assert not kb.complete_task(conn, tid, result="done", expected_run_id=run_id,
+            assert not kb.complete_task(conn, tid, result="done", expected_run_id=run_id, force=True,
                 metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
             assert kb.get_task(conn, tid).current_run_id == github["replacement"]
             assert github["replacement"] != run_id
@@ -146,8 +150,6 @@ def test_acceptance_runs_gh_as_the_assignee_profile(tmp_path, monkeypatch):
     assignee_home = launch_home / "profiles" / "b"
     assignee_home.mkdir(parents=True)
     (assignee_home / ".env").write_text("GH_TOKEN=b-token\n", encoding="utf-8")
-    # Profile identity marker for the write-gate's assignee registry check.
-    (assignee_home / "config.yaml").write_text("{}\n", encoding="utf-8")
     # Ambient residue that must NOT decide the login.
     monkeypatch.setenv("GH_TOKEN", "launch-token")
     monkeypatch.setenv("GH_CONFIG_DIR", "/nonexistent/launch/gh")
@@ -164,6 +166,7 @@ def test_acceptance_runs_gh_as_the_assignee_profile(tmp_path, monkeypatch):
     kb.init_db()
     with connect() as conn:
         tid = kb.create_task(conn, title="as-b", completion_contract="acme/repo", assignee="b")
+        assert kb.request_review(conn, tid, summary="publish the PR")
         assert not kb.complete_task(conn, tid, result="done",
                                     metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
         assert kb.get_task(conn, tid).status != "done"
@@ -188,8 +191,6 @@ def test_assignee_without_own_gh_login_never_falls_through_to_ambient_login(tmp_
     assignee_home = launch_home / "profiles" / "b"
     assignee_home.mkdir(parents=True)
     (assignee_home / ".env").write_text("", encoding="utf-8")
-    # Profile identity marker for the write-gate's assignee registry check.
-    (assignee_home / "config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("GH_TOKEN", "launch-token")
     monkeypatch.setenv("GH_CONFIG_DIR", "/nonexistent/launch/gh")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "launch-xdg"))
@@ -209,6 +210,7 @@ def test_assignee_without_own_gh_login_never_falls_through_to_ambient_login(tmp_
     kb.init_db()
     with connect() as conn:
         tid = kb.create_task(conn, title="as-b", completion_contract="acme/repo", assignee="b")
+        assert kb.request_review(conn, tid, summary="publish the PR")
         assert not kb.complete_task(conn, tid, result="done",
                                     metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
         receipt = json.loads(conn.execute(
@@ -228,6 +230,7 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
     kb.init_db()
     with connect() as conn:
         tid = kb.create_task(conn, title="as-ghost", completion_contract="acme/repo", assignee="ghost")
+        assert kb.request_review(conn, tid, summary="publish the PR")
         assert not kb.complete_task(conn, tid, result="done",
                                     metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
         receipt = json.loads(conn.execute(

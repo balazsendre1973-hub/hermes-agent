@@ -130,6 +130,26 @@ class TestTerminalSidePairsWithFileTools:
     @pytest.mark.parametrize(
         "command",
         [
+            "cp ./hook.py ~/.hermes/agent-hooks/on_start.py 2>&1",
+            "cp ./hook.py ~/.hermes/agent-hooks/on_start.py 2>/dev/null",
+            "cp ./hook.py ~/.hermes/agent-hooks/on_start.py | wc -l",
+            "mv ./helper.py ~/.hermes/scripts/helper.py | tail -n 3",
+            "install ./hook.py ~/.hermes/agent-hooks/on_start.py | cat",
+            "cp ./hook.py ~/.hermes/cron/jobs.json > /dev/null 2>&1",
+        ],
+    )
+    def test_runtime_env_cp_mv_install_with_tail_are_flagged(self, command):
+        """Redirection (`2>&1`, `2>/dev/null`, `> ...`) and pipe (`| ...`) tails
+        after the destination must still be flagged: the file is created."""
+        from tools.approval_detection import detect_dangerous_command
+
+        is_dangerous, _key, description = detect_dangerous_command(command)
+        assert is_dangerous, f"must be flagged: {command}"
+        assert "runtime environment" in description
+
+    @pytest.mark.parametrize(
+        "command",
+        [
             "cat ~/.hermes/cron/jobs.json",        # reading is fine
             "ls -la ~/.hermes/scripts",            # listing is fine
             "grep foo ~/.hermes/profiles/alpha/config.yaml",  # reading is fine
@@ -143,3 +163,77 @@ class TestTerminalSidePairsWithFileTools:
         # rule must never be the reason.
         if is_dangerous:
             assert "runtime environment" not in (description or "")
+
+
+class TestRuntimeEnvInteractiveApproval:
+    """Interaktív sessionben a védett futási-környezeti fájlra írás
+    jóváhajtást kéri; single-query (-q) továbbra is hard deny."""
+
+    @pytest.fixture
+    def interactive_ctx(self, monkeypatch):
+        """Nincs single-query / cron / unattended jelző: a guard az
+        engedélyezési ágra lép (a user a chatben érhető el)."""
+        monkeypatch.setattr("tools.file_tools_write_guards._no_user_can_answer", lambda: False)
+
+    def _write_attempt(self, root, rel="scripts/helper.py"):
+        from tools.file_tools_write_guards import _check_sensitive_path
+        return _check_sensitive_path(str(root / rel), "default")
+
+    def test_interactive_approve_allows_write(self, runtime_root, interactive_ctx, monkeypatch):
+        from tools.terminal_tool import set_approval_callback
+        root = _mk(runtime_root)
+        set_approval_callback(lambda *a, **k: "once")
+        try:
+            err = self._write_attempt(root)
+        finally:
+            set_approval_callback(None)
+        assert err is None, f"approve után a write-nek mennie kellene, kapott: {err}"
+
+    def test_interactive_deny_blocks_write(self, runtime_root, interactive_ctx, monkeypatch):
+        from tools.terminal_tool import set_approval_callback
+        root = _mk(runtime_root)
+        set_approval_callback(lambda *a, **k: "deny")
+        try:
+            err = self._write_attempt(root)
+        finally:
+            set_approval_callback(None)
+        assert err is not None, "deny után a write-nek blokkolódnian kell"
+        assert "has NOT consented" in err
+
+    def test_interactive_timeout_blocks_write(self, runtime_root, interactive_ctx, monkeypatch):
+        from tools.terminal_tool import set_approval_callback
+        root = _mk(runtime_root)
+        set_approval_callback(lambda *a, **k: "timeout")
+        try:
+            err = self._write_attempt(root)
+        finally:
+            set_approval_callback(None)
+        assert err is not None, "timeout után a write-nek blokkolódnian kell"
+        assert "Silence is not consent" in err
+
+    def test_gateway_approve_allows_write(self, runtime_root, interactive_ctx, monkeypatch):
+        import tools.approval as approval_module
+        from tools.approval_context import set_current_session_key
+        root = _mk(runtime_root)
+        session_key = "gw:runtime-env-test"
+        monkeypatch.setenv("HERMES_SESSION_KEY", session_key)
+        set_current_session_key(session_key)
+
+        def notify(data):
+            approval_module.resolve_gateway_approval(session_key, "once")
+
+        approval_module.register_gateway_notify(session_key, notify)
+        try:
+            err = self._write_attempt(root)
+        finally:
+            approval_module.unregister_gateway_notify(session_key)
+        assert err is None, f"gateway /approve után a write-nek mennie kellene, kapott: {err}"
+
+    def test_single_query_still_hard_denies(self, runtime_root, monkeypatch):
+        root = _mk(runtime_root)
+        monkeypatch.setattr("tools.file_tools_write_guards._no_user_can_answer", lambda: True)
+        from tools.file_tools_write_guards import _check_sensitive_path
+        err = _check_sensitive_path(str(root / "scripts/helper.py"), "default")
+        assert err is not None, "single-queryban továbbra is hard deny kell legyen"
+        assert "runtime script" in err
+        assert "t_55e6fd81" in err

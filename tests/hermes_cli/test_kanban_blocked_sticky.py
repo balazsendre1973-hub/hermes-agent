@@ -167,6 +167,7 @@ def test_created_with_initial_status_blocked_is_not_promoted_by_recompute_ready(
 
         # Complete parent task
         kb.claim_task(conn, parent_id)
+        assert kb.request_review(conn, parent_id)
         kb.complete_task(conn, parent_id, result="done")
         assert kb.get_task(conn, parent_id).status == "done"
 

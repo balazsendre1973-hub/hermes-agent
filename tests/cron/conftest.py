@@ -84,6 +84,18 @@ def _reset_session_context_vars():
     _reset_all()
 
 
+@pytest.fixture(autouse=True)
+def _stab_1d_check_green(monkeypatch):
+    """Cron shutdown paths run with STAB-1D-CHECK green in tests.
+
+    pause_job/remove_job/cancel_job_run refuse live shutdown while
+    STAB_1D_CHECK is unset (fail-closed, the production default). The suite
+    exercises job lifecycle with CHECK green; production stays blocked until
+    the verifier (t_ee637aaa) signs STAB-1D-CHECK green.
+    """
+    monkeypatch.setenv("STAB_1D_CHECK", "1")
+
+
 def owner_execution_runner():
     """The production owner execution seam as a ``run_canonical_job`` replacement.
 
@@ -106,7 +118,7 @@ def owner_execution_runner():
                 source=SimpleNamespace(user_id="cron-owner"))}, pending_results={})
         request_id = execution_id or identity
         row = {"admission_id": identity, "request_id": request_id,
-               "principal_id": "cron-owner", "payload": {"text": extra_prompt or ""}}
+               "principal_id": "cron-owner", "owner_epoch": 1, "generation": 1, "payload": {"text": extra_prompt or ""}}
         policy = SimpleNamespace(request_json=json.dumps({
             "cron_job": job, "extra_prompt": extra_prompt, "request_id": request_id}))
 

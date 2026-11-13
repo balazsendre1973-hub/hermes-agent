@@ -100,6 +100,11 @@ JOBS_FILE = CRON_DIR / "jobs.json"
 # inside a live gateway would otherwise report healthy (#32612, #32895).
 TICKER_HEARTBEAT_FILE = CRON_DIR / "ticker_heartbeat"
 TICKER_SUCCESS_FILE = CRON_DIR / "ticker_last_success"
+# Canonical heartbeat marker: its mtime is the timestamp of the last tick that completed
+# without raising, so `stat` reports the last successful tick without parsing file contents.
+# Written/updated on every successful tick by `record_ticker_heartbeat(success=True)`;
+# best-effort and never breaks the tick.
+HEARTBEAT_FILE = CRON_DIR / "heartbeat"
 # Single source of truth for the ticker interval (scheduler_provider.py) and the staleness
 # threshold in `hermes cron status` (hermes_cli/cron.py), so they never drift apart.
 TICKER_INTERVAL_SECONDS = 60
@@ -1281,12 +1286,34 @@ def record_ticker_heartbeat(success: bool = False) -> None:
     report healthy (#32612, #32895).
     Resolution uses ``_current_cron_store()`` so the heartbeat is correctly scoped to the active profile's
     store — critical under multiplex_profiles where each profile needs its own liveness signal (#69377).
+    The canonical heartbeat's mtime is updated on success so `stat` reports the last successful tick
+    for the active store, as the `heartbeat` file used by the watchdog (STAB-1B).
     """
     # ``<epoch> <pid>``: a killed ticker's last stamp reads fresh for ~3 minutes, so a reader with no
     # other proof of the scheduler (the in-process serve/Desktop ticker) checks the writer is alive.
     _write_marker("ticker_heartbeat", f"{time.time()} {os.getpid()}", ".hb_")
     if success:
         _write_marker("ticker_last_success", str(time.time()), ".hb_")
+        _write_heartbeat_success_marker()
+
+
+def _write_heartbeat_success_marker() -> None:
+    """Write/update the canonical heartbeat for the active store so its mtime equals the last
+    successful tick.
+
+    Uses the same atomic temp-file + rename pattern as the other markers, then pins the mtime
+    exactly to the tick timestamp via ``os.utime``: `os.stat(<store>/cron/heartbeat).st_mtime` is the
+    authoritative timestamp of the last successful tick, without parsing file contents. Best-effort —
+    marker writes never break the ticker.
+    """
+    try:
+        ensure_dirs()
+        hb_path = _current_cron_store().cron_dir / "heartbeat"
+        ts = time.time()
+        _write_marker("heartbeat", f"{ts} {os.getpid()}", ".hb_")
+        os.utime(hb_path, (ts, ts))
+    except Exception:
+        pass
 
 
 def _read_marker_fields(name: str) -> list[str]:
@@ -1374,6 +1401,40 @@ def _parse_jobs_file(jobs_file: Path) -> tuple[Any, bool]:
         return json.loads(raw, strict=False), True
 
 
+# Store-level damage is not a job failure, so it gets a synthetic incident id: the wiped
+# store of 2026-11-08 12:46 was invisible for 4.5h because nothing job-shaped had failed.
+STORE_DAMAGE_INCIDENT_JOB_ID = "cron-store"
+# One durable incident write per damaged store per interval (the tick loads every ~60s, and
+# the incident row is a signature-deduped UPDATE, not a new alert per load).
+_STORE_DAMAGE_INCIDENT_INTERVAL = 600.0
+_store_damage_incident_at: dict[str, float] = {}
+
+
+def _note_cron_store_damage(detail: str) -> None:
+    """Name a damaged/directly-overwritten cron store: WARNING per load (the old path returned an
+    empty list in silence, which is how 28 jobs disappeared for 4.5 hours while
+    `hermes cron doctor` printed "no issues") plus ONE durable ``cron_incidents`` row per
+    interval so ``hermes cron incidents`` shows a store nobody ran. Best-effort by design: an
+    unusable incident DB must never break the tick that discovered the damage."""
+    store = str(_current_cron_store().jobs_file)
+    logger.warning("cron store damaged: %s [%s]", detail, store)
+    now = time.monotonic()
+    last = _store_damage_incident_at.get(store)
+    if last is not None and now - last < _STORE_DAMAGE_INCIDENT_INTERVAL:
+        return
+    _store_damage_incident_at[store] = now
+    try:
+        from cron import incidents as _incidents
+
+        _incidents.upsert_incident(
+            STORE_DAMAGE_INCIDENT_JOB_ID,
+            f"{detail} [{store}]",
+            failure_type="config",
+        )
+    except Exception:
+        logger.debug("Could not record a cron store damage incident", exc_info=True)
+
+
 def load_jobs() -> list[dict[str, Any]]:
     """Load all jobs from storage."""
     jobs_file = _current_cron_store().jobs_file
@@ -1402,7 +1463,19 @@ def load_jobs() -> list[dict[str, Any]]:
     unmergeable = False  # disk shape _peek_jobs_unlocked cannot read: only a replace save fixes it
     if isinstance(data, dict):
         jobs = data.get("jobs", [])
-        if isinstance(jobs, dict):
+        if "jobs" not in data:
+            # The measured 2026-11-08 12:46 wipe: a script dumped a single-field payload
+            # ({"prompt": ...}) over the whole store, so the default above handed back []
+            # in silence — 28 jobs gone for 4.5 hours while `cron doctor` stayed green
+            # ("no issues"). Name it loudly on EVERY load and leave the alien bytes on
+            # disk as restore evidence: no save, so nothing is overwritten here.
+            _note_cron_store_damage(
+                f"'jobs' key missing from jobs.json (top-level keys: "
+                f"{', '.join(sorted(map(str, data))) or 'none'}) — the whole store was "
+                f"overwritten by a non-store payload; 0 jobs loaded, restore from a backup "
+                f"(kanban-board-protocol §25)")
+            jobs = []
+        elif isinstance(jobs, dict):
             # ID-keyed map from external tools: flatten (inline "id" wins, else the key), skip junk.
             # _peek_jobs_unlocked deliberately does NOT flatten, so a merging save refuses this
             # shape; the repair below rewrites it with replace=True.
@@ -1414,6 +1487,10 @@ def load_jobs() -> list[dict[str, Any]]:
             unmergeable = True
         elif not isinstance(jobs, list):
             notes.append(f"Replacing invalid jobs.json 'jobs' field ({type(jobs).__name__}) with an empty list")
+            _note_cron_store_damage(
+                f"jobs.json 'jobs' field is {type(jobs).__name__}, not a list — the store is "
+                f"unreadable as a job list; 0 jobs loaded, restore from a backup "
+                f"(kanban-board-protocol §25)")
             jobs = []
             repair = "invalid jobs field replaced with list"
             unmergeable = True
@@ -2171,11 +2248,50 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
     return _with_job(job_id, apply)
 
 
+# STAB-1D Fin-gate (t_400abfca): live cron/monitor shutdown only proceeds after
+# STAB-1D-CHECK is green. Default RED (fail-closed): without STAB_1D_CHECK=1
+# (true/yes/on) in the environment, pause/remove/cancel of a live job is refused
+# and jobs.json is never written.
+STAB_1D_CHECK_ENV = "STAB_1D_CHECK"
+_STAB_1D_CHECK_TRUE = frozenset({"1", "true", "yes", "on"})
+_PAST = {"pause": "paused", "remove": "removed", "cancel": "cancelled"}
+# Cron job ids that may never be paused or removed: live canaries whose cron
+# definition must stay byte-identical (diff=0) across every shutdown path.
+STAB_1D_MUST_KEEP_JOB_IDS = frozenset(
+    {"fd7ddcde3b98", "2a7a950445d5", "156c6e33e460"})
+
+
+def stab_1d_check_green() -> bool:
+    """True once STAB-1D-CHECK (verifier t_ee637aaa) is green. Fail-closed by default."""
+    return str(os.environ.get(STAB_1D_CHECK_ENV, "")).strip().lower() in _STAB_1D_CHECK_TRUE
+
+
+def _require_stab_1d_check_green(job_id: str, action: str, *, must_keep: bool = True) -> None:
+    """Refuse a live cron shutdown unless STAB-1D-CHECK is green.
+
+    Must-keep crons are refused unconditionally so their jobs.json definitions
+    stay diff=0 regardless of CHECK state. ``action`` is "pause"/"remove"/"cancel".
+    """
+    if must_keep and job_id in STAB_1D_MUST_KEEP_JOB_IDS:
+        raise RuntimeError(
+            f"STAB-1D Fin-gate: must-keep cron '{job_id}' may not be "
+            f"{_PAST[action]} (cron definition protected, diff=0).")
+    if not stab_1d_check_green():
+        raise RuntimeError(
+            f"STAB-1D Fin-gate: {action} of live cron job '{job_id}' is blocked until "
+            f"STAB-1D-CHECK is green (set {STAB_1D_CHECK_ENV}=1).")
+
+
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[dict[str, Any]]:
-    """Pause a job without deleting it. Accepts a job ID or name."""
+    """Pause a job without deleting it. Accepts a job ID or name.
+
+    STAB-1D Fin-gate: refused unless STAB-1D-CHECK is green; must-keep crons
+    (fd7ddcde3b98, 2a7a950445d5, 156c6e33e460) are never paused (diff=0).
+    """
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    _require_stab_1d_check_green(job["id"], "pause")
     return update_job(job["id"], {
         "enabled": False,
         "state": "paused",
@@ -2305,11 +2421,16 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[dict[str, Any]]:
 
 
 def remove_job(job_id: str) -> bool:
-    """Remove a job by ID or name."""
+    """Remove a job by ID or name.
+
+    STAB-1D Fin-gate: refused unless STAB-1D-CHECK is green; must-keep crons
+    (fd7ddcde3b98, 2a7a950445d5, 156c6e33e460) are never removed (diff=0).
+    """
     job = resolve_job_ref(job_id)
     if not job:
         return False
     canonical_id = job["id"]
+    _require_stab_1d_check_green(canonical_id, "remove")
     with _jobs_lock():
         jobs = load_jobs()
         original_len = len(jobs)
@@ -2339,7 +2460,13 @@ def remove_job(job_id: str) -> bool:
 
 
 def cancel_job_run(job_id: str, reason: Optional[str] = None) -> dict[str, Any]:
-    """Stop the job's live run (if any); its schedule is untouched. See ``cron.cancellation``."""
+    """Stop the job's live run (if any); its schedule is untouched.
+
+    STAB-1D Fin-gate: refused unless STAB-1D-CHECK is green. Cancelling a run
+    does not alter the cron definition, so must-keep crons may still be
+    cancelled once CHECK is green.
+    """
+    _require_stab_1d_check_green(job_id, "cancel", must_keep=False)
     from cron.cancellation import cancel_run
 
     return cancel_run(job_id, reason=reason)

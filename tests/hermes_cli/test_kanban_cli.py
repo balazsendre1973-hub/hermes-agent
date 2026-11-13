@@ -121,6 +121,7 @@ def test_show_survives_iso_strings_in_integer_timestamp_columns(kanban_home):
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title="corrupted card", assignee="alice")
         assert kb.claim_task(conn, task_id)
+        assert kb.request_review(conn, task_id)
         assert kb.complete_task(conn, task_id, summary="done")
         conn.execute("UPDATE task_runs SET ended_at = ? WHERE task_id = ?", (iso_utc, task_id))
         conn.execute("UPDATE tasks SET completed_at = ? WHERE id = ?", (iso_z, task_id))

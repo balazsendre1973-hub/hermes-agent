@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
-from hermes_cli import kanban_write_gate as _kwg
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
 
@@ -797,13 +796,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     claim_expires        INTEGER,
     tenant               TEXT,
     result               TEXT,
-    -- Registry condition key. ``reg:`` keys are normalised at entry by
-    -- create_task (lowercase, kind-less ``reg:<board>|<id>`` — NEW/new and
-    -- ERROR/error are one condition, the kind belongs to the card body), and
-    -- kanban_db_connect._ensure_reg_idempotency normalises legacy rows,
-    -- archives duplicates and then creates the partial UNIQUE index
-    -- idx_tasks_reg_idempotency (NOCASE, open reg: rows only): the DB-level
-    -- second line behind the create-time lookup.
     idempotency_key      TEXT,
     -- Unified consecutive-failure counter. Incremented on spawn
     -- failure, timeout, or crash; reset only on successful completion.
@@ -991,58 +983,6 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 """
 
 
-# --- Write-gate triggers (hermes_cli.kanban_write_gate) --------------------
-def _write_gate_triggers_sql() -> str:
-    """SQL half of the write-gate: ``RAISE(ABORT)`` on an illegal ``status`` /
-    ``block_kind`` so a DIRECT database write — dispatcher internals, board
-    transfer, an external tool, raw SQL from a worker — fails exactly like a
-    gated Python mutation does. The check lives in the schema, not in the
-    caller (the pragma_gate principle), and the value sets are derived from the
-    same constants the Python checklist reads (``VALID_STATUSES`` /
-    ``VALID_BLOCK_KINDS``), so the two layers cannot drift.
-
-    Only INSERT and UPDATE-of-the-column are gated: existing rows are never
-    rewritten, so a pre-existing oddity can neither wedge reads nor block an
-    unrelated column update — it only refuses to become a NEW illegal value.
-    """
-    statuses = ", ".join(f"'{s}'" for s in sorted(VALID_STATUSES))
-    block_kinds = ", ".join(f"'{k}'" for k in sorted(VALID_BLOCK_KINDS))
-    status_msg = "kanban write-gate: illegal tasks.status"
-    kind_msg = "kanban write-gate: illegal tasks.block_kind"
-    return (
-        "\nCREATE TRIGGER IF NOT EXISTS trg_tasks_status_gate_insert\n"
-        "BEFORE INSERT ON tasks\n"
-        f"WHEN NEW.status IS NULL OR NEW.status NOT IN ({statuses})\n"
-        "BEGIN\n"
-        f"    SELECT RAISE(ABORT, '{status_msg}');\n"
-        "END;\n"
-        "\nCREATE TRIGGER IF NOT EXISTS trg_tasks_status_gate_update\n"
-        "BEFORE UPDATE OF status ON tasks\n"
-        f"WHEN NEW.status IS NULL OR NEW.status NOT IN ({statuses})\n"
-        "BEGIN\n"
-        f"    SELECT RAISE(ABORT, '{status_msg}');\n"
-        "END;\n"
-        "\nCREATE TRIGGER IF NOT EXISTS trg_tasks_block_kind_gate_insert\n"
-        "BEFORE INSERT ON tasks\n"
-        f"WHEN NEW.block_kind IS NOT NULL AND NEW.block_kind NOT IN ({block_kinds})\n"
-        "BEGIN\n"
-        f"    SELECT RAISE(ABORT, '{kind_msg}');\n"
-        "END;\n"
-        "\nCREATE TRIGGER IF NOT EXISTS trg_tasks_block_kind_gate_update\n"
-        "BEFORE UPDATE OF block_kind ON tasks\n"
-        f"WHEN NEW.block_kind IS NOT NULL AND NEW.block_kind NOT IN ({block_kinds})\n"
-        "BEGIN\n"
-        f"    SELECT RAISE(ABORT, '{kind_msg}');\n"
-        "END;\n"
-    )
-
-
-TRIGGER_SQL = _write_gate_triggers_sql()
-# SCHEMA_SQL is re-run on every process's first connect, so the triggers are
-# (re)created idempotently alongside the tables/indexes.
-SCHEMA_SQL = SCHEMA_SQL + TRIGGER_SQL
-
-
 # --- ID generation ---
 
 def _new_task_id() -> str:
@@ -1214,7 +1154,6 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
-@_kwg.gated("create", returns_task_id=True)
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1252,13 +1191,6 @@ def create_task(
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
-    # Write-gate pre-checks: refuse a bad assignee/model/idempotency key BEFORE
-    # anything is written (hermes_cli.kanban_write_gate; the model rule is the
-    # shared hermes_cli.model_gate module the dispatcher preflight uses too).
-    _kwg.require_assignee(conn, assignee)
-    _kwg.require_model(model_override, provider_override)
-    _kwg.require_model_pin(assignee, model_override, provider_override)
-    _kwg.require_idempotency_key(idempotency_key)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -1290,20 +1222,13 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
-    # Registry keys are normalised at entry: `reg:<board>|<id>(|<kind>)` →
-    # lowercase, kind-less `reg:<board>|<id>`. NEW/new/ERROR/error are one
-    # condition — the kind belongs to the card body, not the condition id —
-    # and board case must not mint a second card. Other producers' key
-    # schemes (user:/hermes:/…) pass through untouched.
-    idempotency_key = normalize_reg_idempotency_key(idempotency_key)
-
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
-    # race may insert twice, the next lookup stabilises on the newest. NOCASE:
-    # a row written before the migration normalised its key (or by direct SQL)
-    # still matches.
+    # race may insert twice, the next lookup stabilises on the newest.
     if idempotency_key:
         row = conn.execute(
-            _idempotency_lookup_sql(idempotency_key), (idempotency_key,)
+            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
         ).fetchone()
         if row:
             return row["id"]
@@ -1400,90 +1325,9 @@ def create_task(
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
-            # The partial UNIQUE index on reg: keys closes the lookup→insert
-            # race: a concurrent create won between our lookup and this
-            # INSERT. Read the winner back instead of retrying (the retry
-            # would collide again) — same idempotent contract as the lookup.
-            if idempotency_key:
-                row = conn.execute(
-                    _idempotency_lookup_sql(idempotency_key), (idempotency_key,)
-                ).fetchone()
-                if row:
-                    return row["id"]
             if attempt == 1:
                 raise
     raise RuntimeError("unreachable")
-
-
-def normalize_reg_idempotency_key(key: Optional[str]) -> Optional[str]:
-    """``reg:<board>|<id>(|<kind>)`` → lowercase, kind-less ``reg:<board>|<id>``.
-
-    The kind (new/change/stall/error/paused/gone and any case or agent
-    variant: NEW/ERROR/cron_error/…) is not part of the condition id —
-    dedup happens per card, one card per error class, so the kind belongs
-    on the card body. ``task_register_sync._norm_reg_key`` is the
-    registry-side twin of this rule. Non-``reg:`` keys and malformed values
-    pass through unchanged: other producers' schemes are not ours to
-    rewrite, and a value we cannot parse must not be silently mangled.
-    """
-    if not isinstance(key, str):
-        return key
-    parts = [p.strip() for p in key.split("|")]
-    if len(parts) < 2 or not parts[1]:
-        return key
-    if not parts[0].lower().startswith("reg:"):
-        return key
-    if any(not p for p in parts):
-        return key
-    return f"{parts[0].lower()}|{parts[1].lower()}"
-
-
-# Shared by the create-time idempotency check and the insert-race read-back.
-# reg: keys (the normalised, indexed scheme) match NOCASE so a row written
-# before the migration normalised its key still matches; every other scheme
-# keeps its historic byte-exact semantics — the index only constrains reg:.
-_IDEMPOTENCY_LOOKUP_SQL = (
-    "SELECT id FROM tasks WHERE idempotency_key = ? COLLATE NOCASE "
-    "AND status != 'archived' "
-    "ORDER BY created_at DESC LIMIT 1"
-)
-_IDEMPOTENCY_LOOKUP_EXACT_SQL = (
-    "SELECT id FROM tasks WHERE idempotency_key = ? "
-    "AND status != 'archived' "
-    "ORDER BY created_at DESC LIMIT 1"
-)
-
-
-def _idempotency_lookup_sql(key: Optional[str]) -> str:
-    """NOCASE lookup for ``reg:`` keys, byte-exact for every other scheme."""
-    if isinstance(key, str) and key[:4].lower() == "reg:":
-        return _IDEMPOTENCY_LOOKUP_SQL
-    return _IDEMPOTENCY_LOOKUP_EXACT_SQL
-
-
-def count_duplicate_reg_keys(conn: sqlite3.Connection) -> int:
-    """Open ``reg:`` keys whose normalised form maps to more than one card.
-
-    The monitoring metric (t_d09381f0) for the DB-level idempotency
-    invariant: migration + partial UNIQUE index must leave this at ``0``.
-    Counts distinct duplicated conditions (groups), so one duplicated
-    condition scores 1 no matter how many cards it spawned.
-    """
-    rows = conn.execute(
-        "SELECT idempotency_key FROM tasks "
-        "WHERE idempotency_key LIKE 'reg:%' AND status != 'archived'"
-    ).fetchall()
-    seen: set[str] = set()
-    duplicated: set[str] = set()
-    for row in rows:
-        normed = normalize_reg_idempotency_key(row["idempotency_key"])
-        if normed is None:
-            continue
-        normed = normed.casefold()
-        if normed in seen:
-            duplicated.add(normed)
-        seen.add(normed)
-    return len(duplicated)
 
 
 def _board_meta_for(board: Optional[str]) -> dict:
@@ -1608,11 +1452,9 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-@_kwg.gated("assign")
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
     profile = _canonical_assignee(profile)
-    _kwg.require_assignee(conn, profile)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -1642,7 +1484,6 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     return True
 
 
-@_kwg.gated("model_override")
 def set_model_override(
     conn: sqlite3.Connection, task_id: str, model: Optional[str], provider: Optional[str] = None,
 ) -> bool:
@@ -1650,19 +1491,6 @@ def set_model_override(
     Allowed while ``running``: it applies on the NEXT dispatch, which is the
     rate-limit-recovery flow (set, then reclaim/retry)."""
     model, provider = _validate_model_override(model, provider)
-    _kwg.require_model(model, provider)
-    # Layer (c): the pin is read-only at card level — it may only mirror the
-    # assignee profile's pin (hermes_cli.model_pin_drift), so read the card's
-    # current assignee first. Clearing (model=None) always passes.
-    if model:
-        try:
-            row = conn.execute(
-                "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
-            ).fetchone()
-        except sqlite3.Error:
-            row = None
-        assignee = row[0] if row is not None else None
-        _kwg.require_model_pin(assignee, model, provider)
     return _set_task_override(
         conn, task_id,
         "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?", (model, provider),
@@ -2795,6 +2623,26 @@ class LiveClaimError(ValueError):
         )
 
 
+class ReviewRequiredError(ValueError):
+    """``complete_task`` refused: the card is not in ``review`` and no
+    ``force=True`` override was passed.
+
+    Closure requires verifier approval: the implementer hands off with
+    ``kanban_request_review`` (``status -> review``) and the verifier closes
+    with ``kanban_complete``. ``force=True`` is the operator escape hatch for
+    cancellations / reversals (and it keeps overriding the live-claim fence).
+    A ``ValueError`` so tool error handlers treat it as recoverable."""
+
+    def __init__(self, task_id: str, status: str):
+        self.task_id = task_id
+        self.status = status
+        super().__init__(
+            f"kanban_complete refused: review required for {task_id} "
+            f"(status={status}) — call kanban_request_review; the verifier "
+            "approves and closes it. Cancellations: use --force."
+        )
+
+
 def _claim_is_live(trow) -> bool:
     """True when a ``running`` task's claim still protects a run: the worker process
     it spawned exists (PID + start-time fingerprint). A claim whose worker is gone,
@@ -2809,20 +2657,24 @@ def _claim_is_live(trow) -> bool:
     )
 
 
-@_kwg.gated("complete")
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
 ) -> bool:
-    """``running|ready|blocked|review -> done``; records ``result``.
+    """``review -> done`` (verifier approval) or ``force=True`` closure only;
+    records ``result``.
 
-    ``ready`` is accepted for manual CLI completion, ``review`` for human
-    approval. A ``running`` task under a live claim is only completed with
-    proof of ownership (``expected_run_id``) or ``force=True`` (explicit
-    operator override) — otherwise :class:`LiveClaimError`, the same fence
-    :func:`request_review` applies. With no active run the handoff fields survive via
+    A task may be closed exclusively from ``status == 'review'`` — the
+    implementer hands off with ``kanban_request_review`` and the verifier
+    approves with ``kanban_complete`` — or with ``force=True`` (explicit
+    operator override; cancellations / reversals, and it keeps overriding the
+    live-claim fence). Every other status (``running``, ``ready``, ``blocked``,
+    ``triage``, ``todo``, ``scheduled``) raises :class:`ReviewRequiredError`
+    with an actionable message instead of closing.
+
+    With no active run the handoff fields survive via
     :func:`_synthesize_ended_run`. ``summary`` (defaults to ``result``) and
     ``metadata`` land on the closing run for :func:`build_worker_context`.
     ``created_cards`` are verified first — a phantom id raises
@@ -2859,11 +2711,19 @@ def complete_task(
             (task_id,),
         ).fetchone()
         prior_status = trow["status"] if trow else None
+        if prior_status is None:
+            return False  # unknown id: no state change, the caller names it
         # Refuse to close a LIVE worker's run without proof of ownership
         # (expected_run_id) or an explicit human override (force=True); see
         # _claim_is_live for what "live" means.
         if expected_run_id is None and not force and trow and _claim_is_live(trow):
             raise LiveClaimError(task_id)
+        # Review gate: only a verifier approval (status == 'review') or an
+        # explicit force override may close the card. The live-claim fence
+        # above already protects a running worker's run; this gate protects
+        # the card from being closed without review.
+        if prior_status != "review" and not force:
+            raise ReviewRequiredError(task_id, prior_status)
         sql = """
                 UPDATE tasks
                    SET status       = 'done',
@@ -3218,7 +3078,6 @@ def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> 
     return candidate
 
 
-@_kwg.gated("edit")
 def edit_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, priority: Optional[int] = None,
@@ -3296,7 +3155,6 @@ def edit_task(
     return True
 
 
-@_kwg.gated("block")
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
@@ -3440,8 +3298,11 @@ def request_review(
 
     Implementer and reviewer are recorded on the event so requested changes
     route back to the right profile; ``reviewer`` reassigns the task, and on
-    re-review defaults to the latest ``changes_requested`` provenance. A live
-    claim is only cleared with proof of ownership (``expected_run_id``) or
+    re-review defaults to the latest ``changes_requested`` provenance. A first
+    review that names no reviewer defaults to the board's designated reviewer
+    (:func:`_designated_reviewer`), never to the implementer; a resolved
+    reviewer equal to the implementing run's profile is refused outright.
+    A live claim is only cleared with proof of ownership (``expected_run_id``) or
     ``force=True``. Returns ``bool``, or ``(ok, reason)`` with ``with_reason``.
 
     ``metadata["artifacts"]`` names the handoff's deliverable
@@ -3494,6 +3355,21 @@ def request_review(
                         "latest changes_requested event is missing or "
                         "malformed); pass reviewer= explicitly",
                     )
+                if reviewer is None:
+                    # First review, no explicit reviewer: route to the board's
+                    # designated reviewer instead of leaving the card on the
+                    # implementer. Leaving it produced the self-review loop —
+                    # the review lane dispatches the card's own assignee, so an
+                    # unchanged assignee re-spawned the implementer as its own
+                    # reviewer (t_cb6c8de0: 4 cycles, t_251b6d8a: 5, every
+                    # "approval" written by the coder assignee, 2026-11-12).
+                    # A card the operator already assigned TO the designated
+                    # reviewer (write-monitor verifier cards, reassign-repair)
+                    # keeps it: the default pulls the card off the implementer,
+                    # it never blocks a reviewer-owned card's own handoff.
+                    designated = _designated_reviewer()
+                    if designated and trow["assignee"] != designated:
+                        reviewer = designated
             reviewer = _canonical_assignee(reviewer)
             # The actor is the run that did the work. ``assignee`` is the actor
             # only while a worker holds the card; on a never-claimed card it is
@@ -3512,6 +3388,25 @@ def request_review(
                 implementer = arow["profile"] if arow else None
             if implementer is None and trow["assignee"] != reviewer:
                 implementer = trow["assignee"]
+            if (
+                reviewer is not None
+                and implementer is not None
+                and reviewer == implementer
+            ):
+                # Self-review is the failure mode, not a verdict path: the run
+                # asking for review IS the implementer, so naming that profile
+                # as reviewer just re-queues the card onto itself (t_251b6d8a
+                # once passed reviewer='coder' explicitly; a reviewer spawned
+                # by the old routing tried it too). Refuse instead of looping
+                # — the reviewer's real verdicts are kanban_complete (approve)
+                # and kanban_request_changes (send back).
+                return _ret(
+                    False,
+                    f"reviewer {reviewer!r} is the implementing profile itself — "
+                    "self-review is not allowed: approve with kanban_complete "
+                    "from 'review', or send the card back with "
+                    "kanban_request_changes",
+                )
             assignee_sql = ", assignee = ?" if reviewer is not None else ""
             run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
             params: tuple[Any, ...] = (
@@ -3574,6 +3469,39 @@ def _prior_reviewer(conn: sqlite3.Connection, task_id: str):
     changes_event = _latest_event(conn, task_id, "changes_requested", changes_run["id"])
     reviewer = _json_dict(_row_get(changes_event, "payload")).get("reviewer")
     return reviewer if isinstance(reviewer, str) and reviewer.strip() else False
+
+
+def _designated_reviewer() -> Optional[str]:
+    """The board's designated reviewer for a handoff that names none.
+
+    Resolution order: ``kanban.reviewer`` from config, else the ``verifier``
+    profile when installed. ``None`` — fail-open to the legacy
+    keep-the-assignee behaviour — when neither resolves (a sandboxed home or
+    a deployment without a verifier profile), so installs that predate this
+    default keep working unchanged.
+
+    Without this default a first review handed off without an explicit
+    ``reviewer=`` left the card on the implementer, and the review lane
+    dispatched the card's assignee: the implementer re-spawned as its own
+    reviewer. Measured 2026-11-12: t_cb6c8de0 four review cycles and
+    t_251b6d8a five, every "approval" written by the coder assignee's own
+    runs, the verifier never claiming.
+    """
+    configured = None
+    try:
+        from hermes_cli.config import load_config
+        configured = (load_config() or {}).get("kanban", {}).get("reviewer")
+    except Exception:
+        configured = None
+    name = configured.strip() if isinstance(configured, str) else ""
+    candidate = _canonical_assignee(name or "verifier")
+    if not candidate:
+        return None
+    try:
+        from hermes_cli.profiles import profile_exists
+        return candidate if profile_exists(candidate) else None
+    except Exception:
+        return None
 
 
 def _nonblank_str(value: Any) -> Optional[str]:
@@ -4391,15 +4319,16 @@ from hermes_cli.kanban_db_workspace import (
     _managed_scratch_path_info,
     _scratch_workspace,
 )
-from hermes_cli.kanban_bgproc import _defer_reclaim_for_live_worker, _worker_survived_termination
 from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     DispatchResult,
     _clear_failure_counter,
+    _defer_reclaim_for_live_worker,
     _pid_alive,
     _record_task_failure,
     _terminate_reclaimed_worker,
     _worker_alive,
+    _worker_survived_termination,
     _worker_terminal_timeout_env,
 )

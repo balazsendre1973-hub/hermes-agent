@@ -599,6 +599,7 @@ def test_active_pr_guard_lifts_for_implementer_after_changes_requested(
 
         done_id = kb.create_task(conn, title="recent success", assignee="dev")
         kb.claim_task(conn, done_id)
+        assert kb.request_review(conn, done_id)
         assert kb.complete_task(conn, done_id, summary="done") is True
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (done_id,))
@@ -655,10 +656,7 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
             conn,
             title="domain review",
             assignee="reviewer",
-            # The write-gate refuses a card pinned to a skill that is not
-            # loaded (kanban_preflight.check_skills); use a skill that exists
-            # so the dispatch under test is the thing being asserted.
-            skills=["humanizer"],
+            skills=["domain-specific-review"],
         )
         implementation = kb.claim_task(conn, task_id)
         assert implementation is not None
@@ -684,7 +682,7 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
         result = kbd.dispatch_once(conn, spawn_fn=spawn)
 
     assert task_id in [task[0] for task in result.spawned]
-    assert captured == [["humanizer", "sdlc-review"]]
+    assert captured == [["domain-specific-review", "sdlc-review"]]
 
 
 def test_review_dispatch_honors_global_and_per_profile_caps(
@@ -728,11 +726,13 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
             task for task in globally_capped.spawned if task[0] in review_ids
         ]
 
+        assert kb.request_review(
+            conn, running_id, expected_run_id=running.current_run_id,
+        )
         assert kb.complete_task(
             conn,
             running_id,
             result="done",
-            expected_run_id=running.current_run_id,
         )
         global_dry_run = kbd.dispatch_once(
             conn,
@@ -931,3 +931,184 @@ def test_synthesized_run_for_unassigned_card_keeps_null_profile(kanban_home: Pat
             "SELECT profile, outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,),
         ).fetchone()
         assert (run["outcome"], run["profile"]) == ("blocked", None)
+
+
+# ---------------------------------------------------------------------------
+# Default reviewer: a handoff that names no reviewer must not re-queue the
+# card on its implementer (the self-review loop, t_cb6c8de0 / t_251b6d8a)
+# ---------------------------------------------------------------------------
+
+
+def _install_profile(home: Path, name: str) -> None:
+    """Make ``profile_exists(name)`` true under the sandboxed HERMES_HOME.
+
+    ``config.yaml`` is the identity marker (same pattern as
+    tests/tools/test_kanban_tools.py).
+    """
+    profile = home / "profiles" / name
+    profile.mkdir(parents=True, exist_ok=True)
+    (profile / "config.yaml").write_text("{}\n", encoding="utf-8")
+
+
+def test_request_review_without_reviewer_routes_to_designated_reviewer(
+    kanban_home: Path,
+) -> None:
+    """Regression: the 2026-11-12 self-review loop.
+
+    ``request_review`` with no ``reviewer=`` used to leave the card on its
+    implementer assignee, so the review lane re-spawned the implementer as
+    its own reviewer — t_cb6c8de0 four cycles and t_251b6d8a five, every
+    "approval" written by the coder assignee's own runs, the verifier never
+    claiming. Without an explicit reviewer the handoff must route to the
+    board's designated reviewer (``kanban.reviewer`` / installed
+    ``verifier``)."""
+    _install_profile(kanban_home, "verifier")
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="impl a feature", assignee="worker")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+
+        ok, reason = kb.request_review(
+            conn, tid, summary="Implementation complete",
+            expected_run_id=run_id, with_reason=True,
+        )
+        assert ok is True, reason
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "review"
+        assert task.assignee == "verifier"
+        rr = _events(conn, tid, kind="review_requested")
+        assert len(rr) == 1
+        assert rr[0][1]["implementer"] == "worker"
+        assert rr[0][1]["reviewer"] == "verifier"
+
+
+def test_designated_reviewer_claims_the_review_run(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance measured at the dispatch seam: after a handoff that names
+    no reviewer, the NEXT review run's ``task_runs.profile`` is the
+    designated reviewer, and no second ``review_requested`` event exists."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    _install_profile(kanban_home, "verifier")
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="impl a feature", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="Implementation complete",
+            expected_run_id=claimed.current_run_id,
+        ) is True
+
+        # The review lane dispatches the reassigned card: the spawn tuple
+        # names the verifier, not the assignee that did the work.
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert (tid, "verifier", "") in res.spawned
+
+        # And the actual claim opens the review run under the verifier.
+        review_claimed = kb.claim_review_task(conn, tid, claimer="verifier")
+        assert review_claimed is not None
+        run = conn.execute(
+            "SELECT profile, status FROM task_runs WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        assert (run["profile"], run["status"]) == ("verifier", "running")
+        # One handoff, one review run — no second review_requested event.
+        assert len(_events(conn, tid, kind="review_requested")) == 1
+
+
+def test_request_review_refuses_self_review(kanban_home: Path) -> None:
+    """Structural prevention: a run may not review its own work.
+
+    Naming the implementing profile as reviewer (t_251b6d8a once passed
+    ``reviewer='coder'`` from the coder itself) re-queues the card onto the
+    run asking for review — the loop by another door. The transition is
+    refused and the card stays with its implementer, untouched."""
+    _install_profile(kanban_home, "verifier")
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="impl a feature", assignee="verifier")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+
+        ok, reason = kb.request_review(
+            conn, tid, summary="self review attempt", reviewer="verifier",
+            expected_run_id=run_id, with_reason=True,
+        )
+        assert ok is False
+        assert "self-review" in (reason or "")
+        task = kb.get_task(conn, tid)
+        assert (task.status, task.assignee) == ("running", "verifier")
+        assert _events(conn, tid, kind="review_requested") == []
+
+
+def test_reviewer_owned_card_keeps_its_reviewer_without_an_explicit_arg(
+    kanban_home: Path,
+) -> None:
+    """A card the operator already assigned to the designated reviewer
+    (write-monitor verifier cards, reassign-repair) keeps that reviewer:
+    the default exists to pull the card OFF the implementer, never to
+    block a reviewer-owned card's own handoff. Behaviour is the legacy
+    no-reassignment path."""
+    _install_profile(kanban_home, "verifier")
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="verify the report", assignee="verifier")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+
+        ok = kb.request_review(
+            conn, tid, summary="verification done",
+            expected_run_id=run_id,
+        )
+        assert ok is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "review"
+        assert task.assignee == "verifier"
+        rr = _events(conn, tid, kind="review_requested")
+        assert rr[0][1]["implementer"] == "verifier"
+        assert rr[0][1]["reviewer"] is None
+
+
+def test_designated_reviewer_default_fails_open_when_not_installed(
+    kanban_home: Path,
+) -> None:
+    """No ``verifier`` profile and no ``kanban.reviewer`` → the legacy
+    keep-the-assignee behaviour, so installs that predate the default (and
+    sandboxed homes) are unchanged."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="impl a feature", assignee="worker")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+
+        ok = kb.request_review(
+            conn, tid, summary="Implementation complete",
+            expected_run_id=run_id,
+        )
+        assert ok is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "review"
+        assert task.assignee == "worker"
+        assert _events(conn, tid, kind="review_requested")[0][1]["reviewer"] is None
+
+
+def test_explicit_reviewer_argument_still_routes(kanban_home: Path) -> None:
+    """Regression for the working path (t_05cc4ad7 / t_83183a7e): an
+    explicit ``reviewer=`` is honoured exactly as before."""
+    _install_profile(kanban_home, "verifier")
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="impl a feature", assignee="worker")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+
+        assert kb.request_review(
+            conn, tid, summary="Implementation complete", reviewer="verifier",
+            expected_run_id=run_id,
+        ) is True
+        task = kb.get_task(conn, tid)
+        assert (task.status, task.assignee) == ("review", "verifier")

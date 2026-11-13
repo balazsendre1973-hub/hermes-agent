@@ -179,6 +179,20 @@ def _cmdline_runs_writer(cmd: list[str], writer: str) -> bool:
     return any(os.path.basename(token.rstrip("/")) == wanted for token in cmd)
 
 
+def _cmdline_text_matches_writer(cmd: list[str], writer: str) -> bool:
+    """``writer``'s basename anywhere in the cmdline text.
+
+    Falls back to a substring match for shapes where the writer name is not an
+    argv token of its own — e.g. ``timeout 30 python -c "g.hold_write_lock(lock,
+    writer='indexer.py')"``, where ``indexer.py`` lives only inside the
+    ``-c`` code string.  The design rule still holds: both tokens (``timeout``
+    and the writer) must co-occur in the *same* cmdline, so an unrelated test
+    runner's own ``timeout`` never counts as this writer's wrapper.
+    """
+    wanted = os.path.basename(str(writer))
+    return wanted in " ".join(cmd)
+
+
 def find_timeout_pids(chain, writer: Optional[str] = None) -> tuple[int, ...]:
     """Pids whose cmdline runs *this* writer under a ``timeout(1)`` wrapper.
 
@@ -188,6 +202,11 @@ def find_timeout_pids(chain, writer: Optional[str] = None) -> tuple[int, ...]:
     ``timeout`` around pytest never counts as a wrapper for an unrelated
     writer.  ``writer=None`` (the caller declared no script) degrades to "any
     ``timeout`` ancestor": fail closed rather than silently unscoped.
+
+    Writer detection is token-based (``_cmdline_runs_writer``) plus a
+    substring fallback (``_cmdline_text_matches_writer``) so the
+    ``python -c`` shape is caught too: under it the writer name is passed as a
+    keyword argument inside the code string, never as its own argv token.
 
     The pids are captured while the chain is still readable — a refused writer
     has usually exited by the time its caller inspects the verdict.
@@ -199,7 +218,7 @@ def find_timeout_pids(chain, writer: Optional[str] = None) -> tuple[int, ...]:
             continue
         if not any(_is_timeout_argv(token) or token == "timeout" for token in cmd):
             continue
-        if writer is None or _cmdline_runs_writer(cmd, writer):
+        if writer is None or _cmdline_runs_writer(cmd, writer) or _cmdline_text_matches_writer(cmd, writer):
             hits.append(pid)
     return tuple(hits)
 

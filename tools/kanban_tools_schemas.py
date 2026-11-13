@@ -237,7 +237,11 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
         )),
         "reviewer": _prop("string", (
                 "Optional reviewer profile. When provided, the task is "
-                "reassigned to that profile before review dispatch."
+                "reassigned to that profile before review dispatch. When "
+                "omitted, the handoff routes to the board's designated "
+                "reviewer (kanban.reviewer config, default the installed "
+                "'verifier' profile) — never back to you, the implementer; "
+                "naming your own profile is refused."
         )),
         "metadata": {
             "type": "object",

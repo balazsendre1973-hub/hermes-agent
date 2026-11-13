@@ -74,11 +74,9 @@ def client(kanban_home):
 
 def test_set_and_clear_model_override(conn):
     tid = kb.create_task(conn, title="t", assignee="worker")
-    # A catalog-valid pair (the write-gate refuses models the provider does not
-    # offer — see hermes_cli.model_gate; gpt-4o is in openai's static catalog).
-    assert kb.set_model_override(conn, tid, "gpt-4o", provider="openai")
+    assert kb.set_model_override(conn, tid, "gpt-5.6-sol", provider="openai")
     t = kb.get_task(conn, tid)
-    assert t.model_override == "gpt-4o"
+    assert t.model_override == "gpt-5.6-sol"
     assert t.provider_override == "openai"
 
     # Clearing the model clears the provider too.
@@ -212,28 +210,24 @@ def _create(client, **kwargs):
 
 def test_patch_sets_model_override(client):
     task = _create(client)
-    # Catalog-valid pair: the write-gate refuses a model the provider does not
-    # offer (gpt-4o is in openai's static catalog).
     r = client.patch(
         f"/api/plugins/kanban/tasks/{task['id']}",
-        json={"model_override": "gpt-4o", "provider_override": "openai"},
+        json={"model_override": "gpt-5.6-sol", "provider_override": "openai"},
     )
     assert r.status_code == 200, r.text
     updated = r.json()["task"]
-    assert updated["model_override"] == "gpt-4o"
+    assert updated["model_override"] == "gpt-5.6-sol"
     assert updated["provider_override"] == "openai"
 
 
 def test_bulk_model_override(client):
     t1 = _create(client)
     t2 = _create(client)
-    # Catalog-valid pair: the write-gate refuses models with positive evidence
-    # of absence (z-ai/glm-5.3-flash is in nous's static catalog).
     r = client.post(
         "/api/plugins/kanban/tasks/bulk",
         json={
             "ids": [t1["id"], t2["id"]],
-            "model_override": "z-ai/glm-5.3-flash",
+            "model_override": "fallback-model",
             "provider_override": "nous",
         },
     )
@@ -241,7 +235,7 @@ def test_bulk_model_override(client):
     assert all(entry["ok"] for entry in r.json()["results"])
     for tid in (t1["id"], t2["id"]):
         got = client.get(f"/api/plugins/kanban/tasks/{tid}").json()["task"]
-        assert got["model_override"] == "z-ai/glm-5.3-flash"
+        assert got["model_override"] == "fallback-model"
         assert got["provider_override"] == "nous"
 
 

@@ -196,6 +196,29 @@ def _delivery_platform_routed_from_primary_gateway(platform_name: str) -> bool:
     )
 
 
+def _platform_standalone_only(platform_name: str) -> bool:
+    """True when a platform delivers outside the gateway (``standalone_sender_fn`` with no live
+    gateway adapter), so cron preflight must not require it to be gateway-connected.
+
+    Such platforms (e.g. ``log``) send via their own out-of-process standalone sender whose
+    credentials are validated at send time, not by the gateway, so the "not connected" gate must
+    not block them. Probing ``adapter_factory(None)`` is safe: standalone factories return
+    ``None``; live-adapter factories either return an adapter or raise on a missing config (both
+    treated as "not standalone" and therefore subject to the normal connected check).
+    """
+    try:
+        from gateway.platform_registry import platform_registry
+        entry = platform_registry.get(platform_name)
+    except Exception:
+        return False
+    if entry is None or entry.standalone_sender_fn is None:
+        return False
+    try:
+        return entry.adapter_factory(None) is None
+    except Exception:
+        return False
+
+
 class SharedRouteAdapters:
     """Read-only adapter map for a credentialless satellite profile. ``get(platform, target)``
     resolves the PRIMARY adapter iff the inbound route matcher (``ProfileRoute.matches``) accepts
@@ -225,13 +248,23 @@ class SharedRouteAdapters:
         # A cron target carries no inbound guild anchor, so a route's guild_id is matched against
         # itself — the target-exact discriminators (chat_id/thread_id) authorize the send. Without
         # this the documented ``guild_id + chat_id`` Discord route never authorized cron output.
+        # A Telegram DM's chat id IS the user id for every bot (#104933), so a ``user_id`` DM route
+        # is equally target-exact: feed the target chat id as the user discriminator. Without this
+        # the documented ``user_id``-only Telegram DM route never authorized cron output and the
+        # credentialless satellite fell to standalone "platform 'telegram' not configured/enabled"
+        # (#146336). Other platforms' chat ids live in a separate id space than user ids, so their
+        # ``user_id`` routes stay a miss — fail closed.
         for route in self._routes:
             if str(route.platform).lower() != platform_key:
                 continue
-            if not (route.chat_id or route.thread_id):
+            if not (route.chat_id or route.thread_id or route.user_id):
                 continue  # guild-only routes are not target-exact
+            route_user_id = (
+                str(chat_id) if route.user_id and platform_key == "telegram" else None
+            )
             if route.matches(
                 str(route.platform), guild_id=route.guild_id, chat_id=chat_id, thread_id=thread_id,
+                user_id=route_user_id,
             ):
                 return adapter
         return default
@@ -268,6 +301,8 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
             # bot-chat targets deliver via a local subprocess; failures land in last_delivery_error.
             if _delivery.parse_bot_chat_deliver_token(part) is not None:
                 continue
+            if _delivery.parse_room_deliver_token(part) is not None:
+                continue  # Group Chat posts write the room store directly; no adapter needed.
             platform_parts.append(part.split(":", 1)[0].strip())
     if not platform_parts:
         return None
@@ -298,6 +333,9 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
             # gateway's profile_routes is served by the primary's adapters, so its own unconnected reading
             # is a false block (#97476).
             and not _delivery_platform_routed_from_primary_gateway(platform_name)
+            # Standalone-only platforms (e.g. ``log``) deliver via their own out-of-process sender,
+            # not the gateway, so they have no gateway-connection requirement to enforce here.
+            and not _platform_standalone_only(platform_name)
         ):
             return (
                 f"delivery platform '{platform_name}' has no gateway "

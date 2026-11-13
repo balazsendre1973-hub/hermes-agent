@@ -12,10 +12,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
@@ -34,6 +36,39 @@ _ACTIVE_DELIVERIES: set[str] = set()
 _TERMINAL = ("delivered", "failed", "unknown", "suppressed")
 MAX_TERMINAL_DELIVERIES = 1000
 DEFAULT_DELIVERY_WAIT_TIMEOUT_SECONDS = 300.0
+# Transient send errors are re-queued with backoff instead of terminalized ``failed``:
+# Telegram 429 (honors retry-after) and DNS/timeout/connection errors. Everything else
+# (incl. \"unknown platform X\") fails closed immediately - a misconfigured platform must
+# not be retried forever.
+MAX_DELIVERY_RETRY_ATTEMPTS = 5
+RETRY_BASE_SECONDS = 5.0
+RETRY_CAP_SECONDS = 300.0
+_TRANSIENT_RE = re.compile(r"retry\s+after\s+(\d+)", re.IGNORECASE)
+_DNS_SIGNALS = (
+    "temporary failure in name resolution",
+    "nodename nor servname provided",
+    "[errno -3]",
+    "timed out",
+    "connection refused",
+    "network is unreachable",
+    "no route to host",
+)
+
+
+def _transient_backoff(error: Optional[str], attempt: int) -> Optional[float]:
+    """Seconds until the next retry attempt for a transient send error; None = permanent.
+
+    *attempt* is 1-based: the attempt number that comes next after this failure.
+    """
+    if not error:
+        return None
+    low = error.lower()
+    if "http 429" in low or "too many requests" in low:
+        m = _TRANSIENT_RE.search(low)
+        return float(m.group(1)) if m else RETRY_BASE_SECONDS
+    if any(signal in low for signal in _DNS_SIGNALS):
+        return min(RETRY_CAP_SECONDS, RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
+    return None
 
 
 def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
@@ -133,6 +168,13 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(
         conn, "deliveries", "for_failure",
         "for_failure INTEGER NOT NULL DEFAULT 0",
+    )
+    add_column_if_missing(
+        conn, "deliveries", "retry_attempts",
+        "retry_attempts INTEGER NOT NULL DEFAULT 0",
+    )
+    add_column_if_missing(
+        conn, "deliveries", "next_retry_at", "next_retry_at TEXT",
     )
 
 

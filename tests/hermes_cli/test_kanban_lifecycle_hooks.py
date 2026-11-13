@@ -124,6 +124,7 @@ def test_misbehaving_hook_does_not_break_transition(kanban_home, monkeypatch):
             tid = kb.create_task(conn, title="t", assignee="worker")
             kb.claim_task(conn, tid)
             # Despite the raising hook, completion succeeds and persists.
+            assert kb.request_review(conn, tid, expected_run_id=kb.get_task(conn, tid).current_run_id)
             assert kb.complete_task(conn, tid, summary="ok") is True
             assert kb.get_task(conn, tid).status == "done"
         finally:

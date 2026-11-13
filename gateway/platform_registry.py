@@ -7,6 +7,7 @@ registry first, then the legacy built-in path. Plugin side: ``platform_registry
 .register(PlatformEntry(...))``; gateway side: ``create_adapter("irc", platform_config)``.
 """
 
+import contextlib
 import contextvars
 import logging
 import sys
@@ -17,6 +18,9 @@ from typing import Any, Awaitable, Callable, Optional
 from hermes_constants import hermes_home_key
 
 logger = logging.getLogger(__name__)
+# The verdict of an ``ensure_deps`` an async gateway caller already ran in an executor (#125607).
+_OFF_LOOP_DEPS_RESULT: contextvars.ContextVar[Optional[bool]] = contextvars.ContextVar(
+    "platform_off_loop_deps_result", default=None)
 
 _LoadKey = tuple[Optional[str], str]
 _Loader = Callable[[], None]
@@ -86,6 +90,9 @@ class PlatformEntry:
     emoji: str = "🔌"  # CLI/gateway display
     allow_update_command: bool = True  # /update may be issued from this platform
     platform_hint: str = ""  # injected into the system prompt; empty = none
+    # ``{tool_name: sentence}`` appended to ``platform_hint`` only when the session's toolset (fixed at
+    # prompt build) has that tool, so the hint never recommends a tool cron or the profile disabled.
+    platform_hint_tool_notes: dict = field(default_factory=dict)
     # ``() -> Optional[dict]`` of ``extra`` fields to seed when auto-enabled from env; runs in
     # ``_apply_env_overrides`` BEFORE adapter construction so ``gateway status`` sees it.
     env_enablement_fn: Optional[Callable[[], Optional[dict]]] = None
@@ -106,11 +113,11 @@ class PlatformEntry:
     send_message_handler: Optional[Callable[[dict, str, str, Any], Any]] = None
     # Out-of-process sender for cron without a co-resident gateway:
     # ``async (pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False)
-    # -> {"success": True, "message_id": ...} | {"error": str}``.
+    # -> {"success": True, "message_id": ...} | {"error": str}``; ``notify`` only if declared/**kwargs.
     standalone_sender_fn: Optional[Callable[..., Awaitable[dict]]] = None
-    # True: the platform has no live adapter by design (its factory returns None); cron and other
-    # out-of-process delivery goes through ``standalone_sender_fn``. Startup must not flag such a
-    # platform as adapter_unavailable/fatal — it is served, just without a co-resident connection.
+    # True: the platform deliberately ships NO live adapter (e.g. ``log``). Delivery runs through
+    # its ``standalone_sender_fn`` out of process (cron ``deliver:<platform>``), so recovery must
+    # not stamp ``adapter_unavailable`` for it — there is nothing to heal.
     standalone_only: bool = False
     # Every inbound event is produced by the service the adapter authenticated to with its own
     # credential (an event bus, not a person), so user allowlists and pairing do not apply. Never
@@ -189,21 +196,6 @@ def core_ships_platform(name: str) -> bool:
     value = str(name or "").strip().lower()
     return value in {Platform[member].value for member in Platform._member_names_} or (
         value in Platform._scan_bundled_plugin_platforms()[0])
-
-
-def core_adapter_platform(name: str) -> bool:
-    """*name* is a **static** ``Platform`` member — a core-shipped adapter (telegram, discord, …),
-    unlike a bundled ``plugins/platforms/`` plugin platform, which ``core_ships_platform`` also
-    counts.
-
-    The distinction matters for flags that must not be claimed for somebody else's adapter:
-    ``standalone_only`` on a core name would re-point the startup verdict of a real adapter
-    (disabled, ``needs_attention=False``, no reconnect retry) to a plugin that has no live
-    connection. ``_member_names_`` only ever holds the enum's own members — the pseudo members
-    ``Platform._missing_`` adds for plugin platforms go into ``_member_map_``/``_value2member_map_``
-    instead — so this set stays static however late it is read."""
-    from gateway.config import Platform
-    return str(name or "").strip().lower() in {Platform[member].value for member in Platform._member_names_}
 
 
 class PlatformRegistry:
@@ -508,12 +500,27 @@ class PlatformRegistry:
             entries, _deferred = self._scope_maps(scope)
             return name in entries or name in self._entries or self._load_pending(scope, name)
 
-    def create_adapter(self, name: str, config: Any) -> Optional[Any]:
-        """Create an adapter instance for *name*; None when no entry exists, deps are missing
-        and cannot be installed, ``validate_config`` fails, or the factory raises."""
+    @staticmethod
+    @contextlib.contextmanager
+    def deps_resolved_off_loop(deps_ok: Optional[bool]):
+        """Scope in which ``create_adapter`` reuses *deps_ok* from an ``ensure_deps`` the caller already
+        ran in an executor, so neither the probe nor a failed install re-runs on the event loop."""
+        token = _OFF_LOOP_DEPS_RESULT.set(deps_ok)
+        try:
+            yield
+        finally:
+            _OFF_LOOP_DEPS_RESULT.reset(token)
+
+    def ensure_deps(self, name: str) -> Optional[bool]:
+        """Passive probe, then the ACTIVE installer when deps are missing; None when *name* has no
+        entry. Blocking (``ensure_deps_fn`` may run a pm install for minutes): the gateway calls it
+        through an executor before ``create_adapter`` so the install never stalls its event loop."""
         entry = self.get(name)
         if entry is None:
             return None
+        resolved = _OFF_LOOP_DEPS_RESULT.get()
+        if resolved is not None:
+            return resolved
         def _probe(fn: Callable[[], Any], failure_msg: str) -> bool:
             try:
                 return bool(fn())
@@ -529,6 +536,13 @@ class PlatformRegistry:
         if not deps_ok:
             hint = f" ({entry.install_hint})" if entry.install_hint else ""
             logger.warning("Platform '%s' requirements not met%s", entry.label, hint)
+        return deps_ok
+
+    def create_adapter(self, name: str, config: Any) -> Optional[Any]:
+        """Create an adapter instance for *name*; None when no entry exists, deps are missing
+        and cannot be installed, ``validate_config`` fails, or the factory raises."""
+        entry = self.get(name)
+        if entry is None or not self.ensure_deps(name):
             return None
         if entry.validate_config is not None:
             try:

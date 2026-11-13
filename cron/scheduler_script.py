@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
 from cron.env_settings import cron_env_setting
 from cron.jobs import _ensure_cron_dir
 from pathlib import Path
@@ -92,6 +93,19 @@ def _get_media_send_timeout() -> int:
         "HERMES_CRON_MEDIA_SEND_TIMEOUT", "media_send_timeout_seconds", _positive_int,
         "cron media-send timeout")
     return _DEFAULT_MEDIA_SEND_TIMEOUT if resolved is None else resolved
+
+
+def _media_scaled_timeout(base: float, media_files) -> float:
+    """``base`` widened for the on-disk ``(path, is_voice)`` attachments the way the gateway's own
+    upload deadline grows (``gateway.platforms.helpers.scaled_upload_deadline``): a platform answers
+    an upload only once the file arrived, so a fixed cap reported a delivered file as failed."""
+    from gateway.platforms.helpers import media_upload_seconds, scaled_upload_deadline
+    return scaled_upload_deadline(base, media_upload_seconds(path for path, _voice in media_files or ()))
+
+
+def _media_send_timeout_for(media_path) -> float:
+    """``_get_media_send_timeout()`` for one attachment, widened by its upload time."""
+    return _media_scaled_timeout(_get_media_send_timeout(), [(media_path, False)])
 
 
 def _get_session_db_timeout() -> float:
@@ -444,6 +458,9 @@ def _run_job_script(
     instead of the scripts-dir parent. See #69396. interpreter: the job's optional Python for
     ``.py`` scripts (#8714).
     """
+    from tools.hosted_tool_policy import host_feature_refusal
+    if refusal := host_feature_refusal("cron_scripts", "A cron script"):
+        return False, refusal
     path, err = _resolve_script_path(script_path)
     if path is None:
         return False, err
@@ -481,6 +498,12 @@ def _run_job_script(
         # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
+        # Cron script jobs (no_agent / monitor scripts) run as operator actions,
+        # not as delegate_task descendants: they must not inherit the delegated-child
+        # kanban write fence, else `hermes kanban create/edit` invoked from the
+        # script (ticket_intake.py intake + --sync-level) is rejected with
+        # "delegate_task child contexts cannot mutate Kanban tasks via the CLI".
+        env.pop(DELEGATED_CHILD_ENV_MARKER, None)
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent

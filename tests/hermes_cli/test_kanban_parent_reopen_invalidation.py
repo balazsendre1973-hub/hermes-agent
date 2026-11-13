@@ -37,10 +37,12 @@ def conn(tmp_path: Path):
 
 def _done_parent_with_done_child(conn):
     parent_id = kb.create_task(conn, title="ancestor", assignee="planner")
+    assert kb.request_review(conn, parent_id)
     assert kb.complete_task(conn, parent_id, result="done")
     child_id = kb.create_task(
         conn, title="child", assignee="builder", parents=[parent_id],
     )
+    assert kb.request_review(conn, child_id)
     assert kb.complete_task(conn, child_id, result="done")
     return parent_id, child_id
 
@@ -95,6 +97,7 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     conn, tmp_path, monkeypatch,
 ):
     parent_id = kb.create_task(conn, title="ancestor", assignee="planner")
+    assert kb.request_review(conn, parent_id)
     assert kb.complete_task(conn, parent_id, result="done")
     child_id = kb.create_task(
         conn, title="running child", assignee="builder", parents=[parent_id],
@@ -180,10 +183,12 @@ def test_dashboard_and_db_paths_produce_identical_outcomes(tmp_path, monkeypatch
     def build_graph(tag: str):
         with kbc.connect() as c:
             parent = kb.create_task(c, title=f"{tag}-parent", assignee="planner")
+            assert kb.request_review(c, parent)
             assert kb.complete_task(c, parent, result="done")
             child = kb.create_task(
                 c, title=f"{tag}-child", assignee="builder", parents=[parent],
             )
+            assert kb.request_review(c, child)
             assert kb.complete_task(c, child, result="done")
         return parent, child
 
