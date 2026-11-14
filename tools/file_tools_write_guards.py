@@ -12,7 +12,6 @@ whole-file overwrite of content this task never saw or that changed since.
 
 import fnmatch
 import os
-from collections.abc import Iterable
 from pathlib import Path
 
 from agent.file_safety import get_nt_namespace_error
@@ -145,57 +144,6 @@ def _resolved_or_raw(filepath: str, task_id: str) -> str:
         return filepath
 
 
-def _runtime_env_protection_reason(path: str) -> str | None:
-    """Why *path* is a runtime-environment file under the installation root, or ``None``.
-
-    (d) stability layer (t_55e6fd81): matches ``profiles/<name>/config.yaml|.yml``
-    (any profile — the hard deny in :func:`_check_sensitive_path` only covers the
-    ACTIVE one), ``cron/jobs.json``, ``agent-hooks/*.py`` and ``scripts/*.py``,
-    all resolved against the installation root (:func:`get_default_hermes_root`),
-    never the active home — profile homes live under the root regardless of which
-    profile is active. The root's own ``config.yaml`` is deliberately NOT matched:
-    it is the operator's file and stays writable.
-
-    Returns a short human label of WHAT class matched (for the refusal message)
-    or ``None`` when the path is not protected by this rule. Fails open on any
-    resolution error so an exotic layout can never wedge every write.
-    """
-    try:
-        from hermes_constants import get_default_hermes_root
-
-        root_real = os.path.realpath(str(get_default_hermes_root()))
-        real = os.path.realpath(path)
-        if root_real and real.startswith(root_real + os.sep):
-            rel = Path(real[len(root_real) + 1:]).parts
-        else:
-            return None
-        if (len(rel) == 3 and rel[0] == "profiles" and rel[1] not in ("", ".", "..")
-                and rel[2] in ("config.yaml", "config.yml")):
-            return "a profile config.yaml"
-        if rel == ("cron", "jobs.json"):
-            return "the cron schedule (jobs.json)"
-        if len(rel) == 2 and rel[0] == "agent-hooks" and rel[1].endswith(".py"):
-            return "an agent hook"
-        if len(rel) == 2 and rel[0] == "scripts" and rel[1].endswith(".py"):
-            return "a runtime script"
-        return None
-    except Exception:
-        return None
-
-
-def _check_runtime_env_path(candidates: Iterable[str]) -> str | None:
-    """Hard deny for runtime-environment files (see :func:`_runtime_env_protection_reason`)."""
-    for candidate in candidates:
-        label = _runtime_env_protection_reason(candidate)
-        if label is not None:
-            return (
-                f"Refusing to write to {candidate}: {label} decides how the NEXT Hermes "
-                "start behaves (the stability layer pins runtime-environment files — "
-                "see t_55e6fd81). This is not an editable file: change profile config "
-                "via 'hermes config set', and cron/hooks/scripts via the operator.")
-    return None
-
-
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     # NT/device-namespace guard on the RAW string, BEFORE the task-base join:
@@ -206,7 +154,11 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     nt_err = get_nt_namespace_error(filepath, verb="Write")
     if nt_err:
         return nt_err
-    candidates = (_resolved_or_raw(filepath, task_id), os.path.normpath(_expand_tilde(filepath)))
+    try:
+        expanded = _expand_tilde(filepath, task_id)
+    except ValueError as exc:  # a hosted ``~`` the sandbox gives no meaning to
+        return f"Refusing to write to {filepath}: {exc}"
+    candidates = (_resolved_or_raw(filepath, task_id), os.path.normpath(expanded))
     if _ssh_path_escapes_home(candidates[0]) and _terminal_env_type_for_task(task_id) == "ssh":
         return (
             f"Refusing to write to {filepath}: it climbs above the SSH home and the remote "
@@ -223,20 +175,11 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             f"Refusing to write to Hermes config file: {filepath}\n"
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead.")
-
-    # --- (d) stability layer (t_55e6fd81): runtime-environment files ---------
-    # Files that decide how the NEXT start behaves: every profile's config.yaml,
-    # the cron schedule, agent hooks and runtime scripts. The active-config hard
-    # deny above only covers the CURRENT profile's config; this rule covers the
-    # rest of the installation root regardless of which profile is active — the
-    # measured gap was that `write_file` into another profile's config.yaml (or
-    # straight into cron/jobs.json) needed no consent at all.
-    # The installation root's OWN config.yaml is deliberately NOT matched: it is
-    # the operator's file and stays writable (only profile configs are pinned).
-    runtime_env_err = _check_runtime_env_path(candidates)
-    if runtime_env_err is not None:
-        return runtime_env_err
-
+    # A hosted path names the tenant's sandbox, and its skills are not this host's: resolving it
+    # against this profile's locked skills would stat host paths and name host skills.
+    from tools.hosted_tool_policy import host_feature_enabled
+    if not host_feature_enabled("skills"):
+        return None
     from tools.skill_lock import path_refusal
     if reason := path_refusal(candidates):
         return f"Refusing to write to {filepath}: {reason}"
@@ -292,11 +235,20 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     if not enabled:
         return None
 
-    normalized = os.path.normpath(_expand_tilde(filepath))
+    from tools.environments.sandbox_scope import hosted_scope, sandbox_lexical_path
+    hosted = hosted_scope() is not None
     try:
-        resolved = os.path.realpath(str(_resolve_path_for_task(filepath, task_id)))
+        normalized = os.path.normpath(_expand_tilde(filepath, task_id))
+    except ValueError:
+        if not hosted:
+            raise
+        normalized = os.path.normpath(filepath)  # a hosted ``~`` with no sandbox meaning: judged as written
+    try:
+        anchored = str(_resolve_path_for_task(filepath, task_id))
+        lexical = sandbox_lexical_path(anchored)  # a hosted agent's sandbox path: never resolved here
+        resolved = lexical if lexical is not None else os.path.realpath(anchored)
     except (OSError, ValueError, RuntimeError):
-        resolved = os.path.realpath(normalized)
+        resolved = normalized if hosted else os.path.realpath(normalized)
 
     # ~/.hermes itself is governed by its own guards (config.yaml hard-block,
     # mirror guard, write_approval); this gate targets PROJECT-LOCAL files only.
@@ -356,13 +308,10 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
         return blocked.format(why=_APPROVAL_UNAVAILABLE)
 
     # Gateway surface: block on the button round-trip when a notify callback
-    # is registered for this session. One-operation only — no scope buttons.
+    # is registered for this session, or a background child's lease carries one
+    # past its parent turn (#133514). One-operation only — no scope buttons.
     session_key = get_current_session_key()
-    try:
-        with _approval._lock:
-            notify_cb = _approval._gateway_notify_cbs.get(session_key)
-    except Exception:
-        notify_cb = None
+    notify_cb = _approval._gateway_notify_cb(session_key)
 
     if notify_cb is not None:
         approval_data = {
@@ -528,7 +477,7 @@ def _target_regular_file_state(filepath: str, task_id: str = "default") -> str:
     if _file_ops_uses_host_paths(file_ops):
         # Host writes land on the resolved path, else today's HOST
         # ``_expand_tilde`` fallback — probe exactly that string.
-        probe = _expand_tilde(filepath) if resolved is None else resolved
+        probe = _expand_tilde(filepath, task_id) if resolved is None else resolved
         try:
             return "exists" if Path(probe).is_file() else "absent"
         except OSError:
@@ -643,7 +592,10 @@ def _stale_overwrite_blocker(filepath: str, resolved: str | None, task_id: str) 
         return (
             f"{filepath} was modified since you last read it (external edit or "
             "concurrent agent). Re-read the file before writing.")
-    if not resolved or _has_full_write_baseline(resolved, task_id):
+    from tools.environments.sandbox_scope import hosted_scope
+    if not resolved or hosted_scope() is not None or _has_full_write_baseline(resolved, task_id):
+        # A hosted agent's path names its sandbox, where no host baseline can exist (as for any
+        # remote backend, whose files the host-side existence check below never finds).
         return None
     try:
         exists = Path(resolved).exists()

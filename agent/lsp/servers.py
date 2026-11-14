@@ -114,21 +114,33 @@ def _which(*names: str) -> Optional[str]:
     return next((p for n in names if (p := shutil.which(n))), None)
 
 
+_HOME = os.path.normpath(os.path.expanduser("~"))
+
+
 def _root_or_workspace(file_path: str, workspace: str, markers: Sequence[str], excludes: Sequence[str] = ()) -> Optional[str]:
-    """``nearest_root`` with workspace fallback; ``None`` iff an exclude marker hit."""
+    """``nearest_root`` with workspace fallback; ``None`` iff an exclude marker hit, no project
+    marker was found below ``$HOME``, or ``workspace`` is the caller's ``$HOME`` tree.
+
+    A file under ``$HOME`` with no reachable project marker is throwaway (kanban scratch, probe
+    scripts): skip the language server instead of indexing the entire home tree.
+    """
     ceiling = os.path.dirname(workspace) if workspace else None
     found = nearest_root(file_path, markers, excludes=excludes, ceiling=ceiling)
     if found is None and excludes and nearest_root(file_path, markers, ceiling=ceiling) is not None:
         # None is ambiguous with excludes configured: a hit without them means
         # the exclude fired (gated off); otherwise fall back to the workspace.
         return None
-    return found or workspace
+    if found is not None:
+        return found
+    # No marker below $HOME: the workspace is a subtree of $HOME (kanban task workspace ->
+    # ~/.hermes, profiles, dotfiles). Serving it would index the whole tree -> gate the server.
+    return None if os.path.normpath(workspace).startswith(_HOME) else workspace
 
 
 def _markers_root(markers: Optional[Sequence[str]], excludes: Sequence[str] = ()) -> _RootFn:
     """Root resolver over marker files; ``None`` markers means "always the workspace root"."""
     if markers is None:
-        return lambda fp, ws: ws
+        return lambda fp, ws: None if os.path.normpath(ws) == _HOME else ws
     return lambda fp, ws: _root_or_workspace(fp, ws, markers, excludes=excludes)
 
 

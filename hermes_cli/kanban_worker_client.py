@@ -4,7 +4,7 @@
 try:
     import hermes_bootstrap
 except ModuleNotFoundError as exc:
-    if exc.name != "hermes_bootstrap":
+    if exc.name != "hermes_bootstrap" and not "hermes_bootstrap".startswith(f"{exc.name}."):
         raise
 
 import asyncio
@@ -34,6 +34,10 @@ _RESTART_CONTROL_REASONS = frozenset({'invalid_control_peer', 'incomplete_contro
                                       'invalid_control_response'})
 # Past the board lock wait: the owner's session setup and receipt before and after the write.
 ADMISSION_ANSWER_MARGIN_S = 60.0
+# How often a fenced-``unknown`` execution record may be re-submitted before the submitter stops
+# and reports the refusal. Each re-submit is one attempt at obtaining a fresh admission after the
+# owner invalidated the previous one; a bounded count keeps a re-fencing loop from spinning forever.
+MAX_UNKNOWN_RECOVERIES = 3
 
 
 def admission_answer_budget():
@@ -51,6 +55,10 @@ class _Claim:
     answered: float  # monotonic time of the owner's last answer
     session_id: Optional[str] = None
     admission_id: Optional[str] = None
+    # Owner-fence recoveries: an execution record invalidated out from under this attempt (a
+    # gateway restart fenced it ``unknown``) is re-submitted, never unbounded — a pathological
+    # re-fencing loop must still reach the honest refusal instead of spinning forever.
+    unknown_recoveries: int = 0
 
     def silent_for(self):
         return time.monotonic() - self.answered
@@ -118,38 +126,71 @@ async def _discard(events):
         await events.get()
 
 
+def _booked_result(board_db, params):
+    """The bound interpreter's recorded verdict for this exact attempt, or None when it never
+    booked one — it was killed before recording anything (e.g. a gateway restart fenced it)."""
+    from gateway.session_kanban import worker_result
+    result = worker_result(board_db, params)
+    return result if result.get('exit_code') is not None else None
+
+
 async def _await_receipt(client, params, board_db, claim):
     """Submit the claim (or, on a later connection, re-read the admission it got) and return its
     settled receipt, recording each owner answer on *claim*."""
-    if claim.admission_id is None:
-        db = str(await asyncio.to_thread(Path(board_db).resolve))
-        # The owner answers only after it checks the claim and writes its ``owner_admitted`` marker
-        # in one board write transaction. The board (the cross-profile dispatch bus) can make that
-        # wait out its busy timeout, so the 30 s default left the owner admitting an attempt whose
-        # submitter had exited (the later-bound worker's submitter-liveness watcher ended it, and the
-        # admission was left ``unknown``). The wait is still finite: once the marker commits,
-        # ``enforce_max_runtime`` and TTL reclaim skip the run (``owner_reclaim_paused``), so an owner
-        # that stalls after admitting is bounded by this wait and ``OWNER_WAIT_S``.
-        accepted = await client.rpc('kanban.run', _timeout=admission_answer_budget(), **dict(params, db=db))
-        receipt = accepted['receipt']
-        claim.session_id, claim.admission_id = accepted['session_id'], receipt['admission_id']
-        print(f'Session: {claim.session_id}', file=sys.stderr)
-    else:
-        receipt = await _receipt(client, claim)
-    claim.answered = time.monotonic()
-    while receipt['status'] not in {'terminal', 'unknown'}:
-        await asyncio.sleep(.2)
-        receipt = await _receipt(client, claim)
+    while True:
+        if claim.admission_id is None:
+            db = str(await asyncio.to_thread(Path(board_db).resolve))
+            # The owner answers only after it checks the claim and writes its ``owner_admitted`` marker
+            # in one board write transaction. The board (the cross-profile dispatch bus) can make that
+            # wait out its busy timeout, so the 30 s default left the owner admitting an attempt whose
+            # submitter had exited (the later-bound worker's submitter-liveness watcher ended it, and the
+            # admission was left ``unknown``). The wait is still finite: once the marker commits,
+            # ``enforce_max_runtime`` and TTL reclaim skip the run (``owner_reclaim_paused``), so an owner
+            # that stalls after admitting is bounded by this wait and ``OWNER_WAIT_S``.
+            accepted = await client.rpc('kanban.run', _timeout=admission_answer_budget(), **dict(params, db=db))
+            receipt = accepted['receipt']
+            claim.session_id, claim.admission_id = accepted['session_id'], receipt['admission_id']
+            print(f'Session: {claim.session_id}', file=sys.stderr)
+        else:
+            receipt = await _receipt(client, claim)
         claim.answered = time.monotonic()
-    return receipt
+        while receipt['status'] not in {'terminal', 'unknown'}:
+            await asyncio.sleep(.2)
+            receipt = await _receipt(client, claim)
+            claim.answered = time.monotonic()
+        if receipt['status'] != 'unknown':
+            return receipt
+        # The owner fenced this admission ``unknown``. Two shapes share that status:
+        #   * the bound interpreter booked a verdict for THIS attempt (it failed and the owner
+        #     settled the loss) — the execution is over: return so ``_exit_code`` reports that
+        #     verdict (75 quota / 78 re-login / 1) instead of a bare refusal;
+        #   * no verdict exists — a gateway restart invalidated the execution record
+        #     (``recover_session_inputs`` fenced it) — re-submit so ``admit_session_input`` can
+        #     resurrect the restart-fenced ``unknown`` to ``queued`` and the attempt runs again.
+        # Bounded: a re-fencing loop must still reach the honest refusal.
+        if await asyncio.to_thread(_booked_result, board_db, params) is not None:
+            return receipt
+        if claim.unknown_recoveries >= MAX_UNKNOWN_RECOVERIES:
+            return receipt
+        claim.unknown_recoveries += 1
+        claim.admission_id = None
+        claim.session_id = None
 
 
 def _exit_code(receipt, params, board_db):
     from hermes_cli.gateway_client import GatewayClientError
-    if receipt['status'] == 'unknown':
-        raise GatewayClientError('Kanban execution unknown; retained by owner')
     from gateway.session_kanban import worker_result
     result = worker_result(board_db, params)
+    if receipt['status'] == 'unknown':
+        # The owner could not confirm this execution. If the bound interpreter booked a verdict
+        # for this attempt, that verdict IS the outcome (75 quota / 78 re-login / 1): report it
+        # instead of masking a quota wall behind a bare exit 1. Only an execution with no verdict
+        # at all — an invalidation the owner never resolved — is refused outright.
+        if result.get('exit_code') is not None:
+            if result.get('last_output'):
+                print(result['last_output'])
+            return int(result['exit_code'])
+        raise GatewayClientError('Kanban execution unknown; retained by owner')
     # The attempt's reply ends the log, as a one-shot worker's did: crash diagnostics quote it.
     if result.get('last_output'):
         print(result['last_output'])

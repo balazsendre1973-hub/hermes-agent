@@ -784,6 +784,15 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"kanban_complete blocked: {empty_err}. Your task is still in-flight (no state "
                 f"change). Retry kanban_complete with a non-empty summary or result describing "
                 f"what was done.")
+        except kb.ReviewRequiredError as review_err:
+            # Nothing was mutated: the worker hands off through
+            # kanban_request_review so the verifier can approve, or an
+            # operator closes with `hermes kanban complete --force`.
+            return tool_error(
+                f"kanban_complete blocked: {review_err}. Your task is still "
+                f"in-flight (no state change). Hand off via "
+                f"`kanban_request_review` for verifier approval, or pass "
+                f"`force=True` / `--force` for the operator override.")
         task = kb.get_task(conn, tid)
         if not ok:
             # complete_task reports every refusal as bare False; a reopened or
@@ -1312,4 +1321,7 @@ _TOOLS = (
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode
     registry.register(name=_name, toolset="kanban", schema=_sch, handler=_handler, emoji=_emoji,
-                      check_fn=_gate)
+                      check_fn=_gate, compat_args=_UNDECLARED_ARGS.get(_name, ()),
+                      # _kanban_handler rejects unknown keys before anything else and each handler
+                      # words its own missing-field errors, so required arguments stay with it.
+                      self_checked_args=_sch["parameters"].get("required", ()))

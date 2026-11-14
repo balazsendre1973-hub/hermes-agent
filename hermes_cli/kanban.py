@@ -931,6 +931,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
                                  f"describing what was done (an empty completion is not evidence).")
                 return False
+            except kb.ReviewRequiredError as review_err:
+                fail_msg[tid] = str(review_err)
+                return False
             if not done:
                 # complete_task returns bare False for a dependency refusal too;
                 # name the open parents instead of claiming the id is unknown.
@@ -982,9 +985,11 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     kind = getattr(args, "kind", None)
+    force = bool(getattr(args, "force", False))
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
+    fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
             # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
@@ -1001,9 +1006,20 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
             return f"Blocked {tid}{suffix}"
 
-        op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+        def op(tid):
+            try:
+                return kb.block_task(
+                    conn, tid, reason=reason, kind=kind,
+                    expected_run_id=_worker_run_id_for(tid), force=force,
+                )
+            except kb.LiveClaimError:
+                fail_msg[tid] = (f"cannot block {tid}: a live worker is running it. "
+                                 f"Wait for the worker, `hermes kanban reclaim {tid}` to "
+                                 f"release it, or re-run with --force to block anyway.")
+                return False
+
+        op = _commented(conn, reason, author, "BLOCKED", op)
+        return _bulk_apply(ids, op, ok_msg, lambda tid: fail_msg.get(tid, f"cannot block {tid}"))
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
@@ -1152,6 +1168,23 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _caller_identity_for_target(platform: str, chat_id: str, thread_id, user_id, user_id_alt) -> tuple:
+    """``(user_id, user_id_alt)`` for a subscription, the calling gateway session's sender filled
+    in when the target IS that session's chat and no id was given. An agent running this command
+    from a group chat omits ``--user-id``; under ``group_sessions_per_user`` the wake would then key
+    a second, participant-less session (#147522). Another chat's (or topic's) subscription is
+    never stamped with the caller's identity."""
+    if user_id or user_id_alt:  # an explicit recipient is never paired with the caller's other id
+        return user_id, user_id_alt
+    from gateway.session_context import get_session_env
+    if (str(get_session_env("HERMES_SESSION_PLATFORM", "")).lower() != str(platform or "").lower()
+            or str(get_session_env("HERMES_SESSION_CHAT_ID", "")) != str(chat_id or "")
+            or str(get_session_env("HERMES_SESSION_THREAD_ID", "")) != str(thread_id or "")):
+        return user_id, user_id_alt
+    return (get_session_env("HERMES_SESSION_USER_ID", "") or None,
+            get_session_env("HERMES_SESSION_USER_ID_ALT", "") or None)
+
+
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
     delivery_metadata = {
         key: value
@@ -1161,13 +1194,15 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
         )
         if value
     }
+    user_id, user_id_alt = _caller_identity_for_target(
+        args.platform, args.chat_id, args.thread_id, args.user_id, getattr(args, "user_id_alt", None))
     with kbc.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
             return _err(f"no such task: {args.task_id}")
         kbn.add_notify_sub(
             conn, task_id=args.task_id, platform=args.platform, chat_id=args.chat_id,
-            chat_type=args.chat_type, thread_id=args.thread_id, user_id=args.user_id,
-            user_id_alt=getattr(args, "user_id_alt", None),
+            chat_type=args.chat_type, thread_id=args.thread_id, user_id=user_id,
+            user_id_alt=user_id_alt,
             notifier_profile=args.notifier_profile or _profile_author(),
             delivery_mode=getattr(args, "delivery_mode", None),
             delivery_metadata=delivery_metadata or None,

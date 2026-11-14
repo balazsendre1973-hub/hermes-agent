@@ -1,16 +1,16 @@
-name: log-platform
-label: log
+name: operator-chat-platform
+label: operator-chat
 kind: platform
 version: 0.1.0
 description: >
-  Log csatorna kézbesítési platform a cron jobok számára.
+  operator-chat kézbesítési platform a cron jobok számára.
   A szöveges kimenet a LOG_TELEGRAM_TOKEN mögötti Telegram bot privát
-  chatjába (chat_id 8832329921 = Endre Balázs DM = Log csatorna) kerül.
+  chatjába (chat_id 8832329921 = Endre Balázs DM = operator-chat) kerül.
   LLM-mentes, kikerülő (standalone) küldő: nincs hozzá live adapter, a
   magkódot nem módosítja (LiveUpdate-biztos).
 author: coder (Hermes agent) + Endre Balázs
 requires_env:
   - name: LOG_TELEGRAM_TOKEN
-    description: "A Log csatorna Telegram bot tokena a cron kézbesítéshez"
-    prompt: "Log Telegram bot token"
+    description: "A operator-chat Telegram bot tokena a cron kézbesítéshez"
+    prompt: "Operator-chat Telegram bot token"
     password: true

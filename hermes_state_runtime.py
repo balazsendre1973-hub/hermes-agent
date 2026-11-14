@@ -157,6 +157,23 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
         if old is not None:
             if old['payload_digest'] != digest:
                 raise RuntimeStoreError('admission_conflict', **ADMITTED_REQUEST_CONFLICT)
+            if old['status'] == 'unknown':
+                # An exact replay of an attempt the owner fenced ``unknown``. Two shapes share that
+                # status: a gateway restart (``recover_session_inputs`` set BOTH this admission and
+                # its worker-executions row ``unknown``) — the execution record was invalidated
+                # out from under a still-live attempt, so resurrect it to ``queued`` and let the
+                # retry run; and a lost managed worker (``lose_admission_worker`` set the worker row
+                # ``terminal``) — that proves the execution is over, so its ``unknown`` must stand
+                # and the submitter reports the booked ``worker_result`` instead of resurrecting the
+                # loss fence (which would wedge the card forever).
+                worker = conn.execute(
+                    "SELECT status FROM worker_executions WHERE execution_id=?",
+                    ('admission-worker:' + old['admission_id'],)).fetchone()
+                if worker is None or worker['status'] != 'terminal':
+                    conn.execute("UPDATE session_admissions SET status='queued' WHERE admission_id=?",
+                                 (old['admission_id'],))
+                    old = conn.execute('SELECT * FROM session_admissions WHERE admission_id=?',
+                                       (old['admission_id'],)).fetchone()
             if _replay_guard is not None:
                 _replay_guard(conn)
             return _row(old)

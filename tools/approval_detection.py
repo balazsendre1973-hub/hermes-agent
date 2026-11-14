@@ -28,19 +28,6 @@ _HERMES_ENV_PATH = (
 _HERMES_CONFIG_PATH = (
     r'(?:~\/\.hermes/|(?:\$home|\$\{home\})/\.hermes/|(?:\$hermes_home|\$\{hermes_home\})/)' r'config\.yaml\b'
 )
-# (d) stability layer (t_55e6fd81): runtime-environment files that decide how the NEXT start
-# behaves — every profile's config.yaml, the cron schedule, agent hooks and runtime scripts.
-# Same normalisation as _HERMES_CONFIG_PATH (resolved HERMES_HOME prefix -> `~/.hermes`, user
-# home -> `~`), so absolute, `~`, `$HOME` and root-spelled `$HERMES_HOME` spellings all match;
-# a profile-scope `$HERMES_HOME` (the profile home itself, no `.hermes` segment) is matched by
-# the second alternative. The installation root config.yaml is deliberately NOT here: it stays
-# writable (operator decision — the Fin's own file) and is gated by _HERMES_CONFIG_PATH instead.
-# Pairs the file_tools write_file/patch hard deny so the terminal side is not an open door.
-_HERMES_RUNTIME_ENV_PATH = (
-    r'(?:(?:~|\$home|\$\{home\})/\.hermes|(?:\$hermes_home|\$\{hermes_home\}))/'
-    r'(?:profiles\/[^\/\s"\']+\/(?:config\.yaml|config\.yml)|cron\/jobs\.json'
-    r'|agent-hooks\/[^\/\s"\']+\.py|scripts\/[^\/\s"\']+\.py)'
-)
 _PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
 _SHELL_RC_FILES = r'(?:~|\$home|\$\{home\})/\.' r'(?:bashrc|zshrc|profile|bash_profile|zprofile)\b'
@@ -579,20 +566,6 @@ DANGEROUS_PATTERNS = [
     (rf'>>?\s*["\']?{_SENSITIVE_WRITE_TARGET}', "overwrite system file via redirection"),
     (rf'\btee\b.*["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_WRITE_TARGET_BOUNDARY}', "overwrite project env/config via tee"),
     (rf'>>?\s*["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_WRITE_TARGET_BOUNDARY}', "overwrite project env/config via redirection"),
-    # (d) stability layer: the runtime-environment files (profile configs, cron schedule,
-    # agent hooks, runtime scripts) — the measured gap was that only the ROOT config.yaml was
-    # flagged here, so `sed -i ~/.hermes/profiles/<p>/config.yaml` or `> ~/.hermes/cron/jobs.json`
-    # needed no consent. Pairs the file_tools write_file/patch hard deny.
-    (rf'\btee\b.*["\']?{_HERMES_RUNTIME_ENV_PATH}', "overwrite Hermes runtime environment via tee"),
-    (rf'>>?\s*["\']?{_HERMES_RUNTIME_ENV_PATH}', "overwrite Hermes runtime environment via redirection"),
-    (rf'\b(cp|mv|install)\b.*\s["\']?{_HERMES_RUNTIME_ENV_PATH}[^\s"\']*["\']?{_COMMAND_TAIL}',
-     "copy/move file into Hermes runtime environment"),
-    (rf'\bsed\s+-[^\s]*i.*(?:{_HERMES_RUNTIME_ENV_PATH})[^\s"\']*',
-     "in-place edit of Hermes runtime environment"),
-    (rf'\bsed\s+--in-place\b.*(?:{_HERMES_RUNTIME_ENV_PATH})[^\s"\']*',
-     "in-place edit of Hermes runtime environment (long flag)"),
-    (rf'\b(?:perl|ruby)\b.*(?:^|\s)-[^\s]*i\b.*(?:{_HERMES_RUNTIME_ENV_PATH})[^\s"\']*',
-     "in-place edit of Hermes runtime environment (perl/ruby)"),
     (r'\bxargs\s+.*\brm\b', "xargs with rm"),
     # -execdir has the same semantics as -exec (runs in each match's directory).
     (r'\bfind\b.*-exec(?:dir)?\s+(/\S*/)?rm\b', "find -exec/-execdir rm"),

@@ -322,6 +322,9 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _arg("--force", action="store_true",
+             help="Override the live-claim guard: block a running, claimed task "
+                  "even without owning its run (clears the worker's claim)."),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,

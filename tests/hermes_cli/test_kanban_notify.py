@@ -1060,6 +1060,7 @@ def _make_done_task_with_sub(kb, conn, *, title, chat_id):
         conn, task_id=tid, platform="telegram", chat_id=chat_id,
         notifier_profile="default",
     )
+    assert kb.request_review(conn, tid, summary="done")
     assert kb.complete_task(conn, tid, summary="done")
     return tid
 

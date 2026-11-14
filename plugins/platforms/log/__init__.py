@@ -1,7 +1,7 @@
-"""log platform plugin — cron kimenet kézbesítése a Log csatornára (Telegram).
+"""operator-chat platform plugin — cron kimenet kézbesítése az operator-chat csatornára (Telegram).
 
 A job szöveges kimenete a LOG_TELEGRAM_TOKEN mögötti bot privát chatjába
-(chat_id 8832329921 = Endre Balázs DM = Log csatorna) kerül.
+(chat_id 8832329921 = Endre Balázs DM = operator-chat) kerül.
 LLM-mentes, kikerülő (standalone) küldő: nincs hozzá live adapter, a magkódot
 nem módosítja (LiveUpdate-biztos).
 """
@@ -14,9 +14,9 @@ import urllib.request
 
 logger = logging.getLogger("plugins.log")
 
-PLATFORM_NAME = "log"
+PLATFORM_NAME = "operator-chat"
 LOG_TOKEN_ENV = "LOG_TELEGRAM_TOKEN"
-LOG_CHAT_ID = "8832329921"  # Endre Balazs DM = Log csatorna
+LOG_CHAT_ID = "8832329921"  # Endre Balazs DM = operator-chat
 TELEGRAM_SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
 # A Telegram 4096-os limitje UTF-16 EGYSÉG, nem kód pont: 4000 darab astral emoji 8000
 # egység → 400 (retry_after) → a teljes kézbesítés elbukik. Ezért itt is UTF-16 a mérték.
@@ -27,7 +27,7 @@ def _utf16_len(text: str) -> int:
     """UTF-16 egységek száma — ugyanaz, mint a ``gateway/platforms/base.py`` ``utf16_lennel``.
 
     A plugin nem importálhat gateway-modult (a betöltés a gateway folyamatában, a
-    platform-regisztráció idején történik), ezért a mérték itt él. Egy astral emoji (CJK
+    platform-regisztráció időpontjában történik), ezért a mérték itt él. Egy astral emoji (CJK
     Ext B, emoji) 2 egység, amit a Python ``len()`` 1-nek számol.
     """
     return len(text.encode("utf-16-le")) // 2
@@ -59,7 +59,7 @@ def _redact_outbound(text: str) -> str:
     ``cron/scheduler_delivery._redact_cron_payload``.
 
     A cron útvonal a lane-ek előtt redaktál, de a közvetlen útvonal (``hermes send
-    --target log``, ``tools/send_message_tool``) nem: a küldő fölött itt sem bízunk meg,
+    --target operator-chat``, ``tools/send_message_tool``) nem: a küldő fölött itt sem bízunk meg,
     a ``force=True`` a biztonsági határ, amit a ``security.redact_secrets`` preferencia
     nem kapcsolhat ki. Ha a redaktálás maga hibázik, a payload nem megy ki."""
     if not text:
@@ -68,7 +68,7 @@ def _redact_outbound(text: str) -> str:
         from agent.redact import redact_sensitive_text
         return redact_sensitive_text(text, force=True)
     except Exception as exc:
-        logger.warning("log platform: redaction failed, payload dropped: %s", exc)
+        logger.warning("operator-chat platform: redaction failed, payload dropped: %s", exc)
         return "[REDACTED - redaction failed]"
 
 
@@ -122,7 +122,7 @@ async def log_standalone_send(
     media_files=None,
     force_document=False,
 ):
-    """PlatformEntry.standalone_sender_fn: cron delivery a Log csatornára.
+    """PlatformEntry.standalone_sender_fn: cron delivery az operator-chat-ra.
 
     Visszaadja a _send_to_platform-al kompatibilis dictet:
     {"success": True, "message_id": "..."} | {"error": "..."}.
@@ -132,8 +132,8 @@ async def log_standalone_send(
     _chunk_utf16) — a Telegram limitje UTF-16, nem kód pont.
     """
     del pconfig, thread_id, media_files, force_document
-    # AZ ELSŐ lépés: bármely küldő jöhet (cron, `hermes send --target log`, tool) és egy
-    # titok a szövegben egyenesen a Log csatornára menne — itt nem bízunk a küldőben.
+    # AZ ELSŐ lépés: bármely küldő jöhet (cron, `hermes send --target operator-chat`, tool) és egy
+    # titok a szövegben egyenesen az operator-chatba menne — itt nem bízunk a küldőben.
     message = _redact_outbound(message or "")
     token = _log_token()
     if not token:
@@ -151,7 +151,7 @@ async def log_standalone_send(
             return {"error": err}
         last_message_id = result.get("message_id")
     logger.info(
-        "log platform: %d darab chunk elkeszitve, utolso message_id=%s chat_id=%s",
+        "operator-chat platform: %d darab chunk elkeszitve, utolso message_id=%s chat_id=%s",
         num_chunks, last_message_id, target,
     )
     return {
@@ -175,23 +175,21 @@ def _log_adapter_factory(pconfig):
 def register(ctx) -> None:
     """Plugin belépési pont; a futo gateway betolti az indulaskor."""
     ctx.register_platform(
-        name="log",
-        label="Log channel (Telegram)",
+        name="operator-chat",
+        label="operator-chat (Telegram)",
         adapter_factory=_log_adapter_factory,
         check_fn=_check_log_requirements,
         # Konvenció szerint a TELJES home-channel env változó neve (lásd BUZZ_HOME_CHANNEL,
-        # DISCORD_HOME_CHANNEL): deliver=log (chat id nélkül) innen olvassa a célt.
+        # DISCORD_HOME_CHANNEL): deliver=operator-chat (chat id nélkül) innen olvassa a célt.
         cron_deliver_env_var="LOG_HOME_CHANNEL",
-        standalone_sender_fn=log_standalone_send,
-        # No live adapter by design: cron delivery goes through standalone_sender_fn; the gateway
-        # startup must not flag this as adapter_unavailable/fatal (standalone-only platform).
         standalone_only=True,
+        standalone_sender_fn=log_standalone_send,
         emoji="\U0001f4c5",
         max_message_length=0,
         pii_safe=False,
         allow_update_command=False,
         platform_hint=(
-            "The 'log' platform is a send-only cron delivery lane: posts job output to the "
-            "Telegram bot behind LOG_TELEGRAM_TOKEN (Log channel). No inbound, no LLM."
+            "The 'operator-chat' platform is a send-only cron delivery lane: posts job output to the "
+            "Telegram bot behind LOG_TELEGRAM_TOKEN (operator-chat). No inbound, no LLM."
         ),
     )

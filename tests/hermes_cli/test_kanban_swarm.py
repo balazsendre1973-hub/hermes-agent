@@ -225,6 +225,7 @@ def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path):
             synthesizer_assignee="writer",
         )
 
+        assert kb.request_review(conn, created.worker_ids[0], summary="A done")
         kb.complete_task(
             conn,
             created.worker_ids[0],
@@ -239,6 +240,7 @@ def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path):
         assert verifier.status == "todo"
         assert synthesizer.status == "todo"
 
+        assert kb.request_review(conn, created.worker_ids[1], summary="B done")
         kb.complete_task(conn, created.worker_ids[1], summary="B done")
         kb.recompute_ready(conn)
         verifier = kb.get_task(conn, created.verifier_id)
@@ -248,6 +250,7 @@ def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path):
         assert verifier.status == "ready"
         assert synthesizer.status == "todo"
 
+        assert kb.request_review(conn, created.verifier_id, summary="Verified both branches")
         kb.complete_task(
             conn,
             created.verifier_id,

@@ -143,6 +143,7 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
         task_id,
         summary="Approved after independent verification.",
         expected_run_id=review_2.current_run_id,
+        force=True,
     )
 
     completed = kb.get_task(conn, task_id)
@@ -216,6 +217,7 @@ def test_review_changes_reapply_parent_gate(conn):
 
     # Move the task through review while its parent is temporarily terminal,
     # then make the parent non-terminal again before changes are requested.
+    assert kb.request_review(conn, parent_id)
     assert kb.complete_task(conn, parent_id, result="done")
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
     assert implementation is not None
@@ -244,6 +246,7 @@ def test_review_changes_reapply_parent_gate(conn):
 
 def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
     parent_id = kb.create_task(conn, title="Parent", assignee="planner")
+    assert kb.request_review(conn, parent_id)
     assert kb.complete_task(conn, parent_id, result="done")
     task_id = kb.create_task(
         conn,
@@ -264,6 +267,7 @@ def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
     still_running = kb.get_task(conn, task_id)
     assert still_running is not None
     assert still_running.status == "running"
+    assert kb.request_review(conn, parent_id)
     assert kb.complete_task(conn, parent_id, result="done")
     assert kb.request_review(
         conn,
@@ -502,6 +506,7 @@ def test_review_escalation_unblocks_back_to_review(conn) -> None:
 
 def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> None:
     parent_id = kb.create_task(conn, title="Parent", assignee="planner")
+    assert kb.request_review(conn, parent_id)
     assert kb.complete_task(conn, parent_id, result="done")
     task_id = kb.create_task(
         conn,
@@ -532,6 +537,7 @@ def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> N
     waiting = kb.get_task(conn, task_id)
     assert waiting is not None
     assert waiting.status == "todo"
+    assert kb.request_review(conn, parent_id)
     assert kb.complete_task(conn, parent_id, result="done")
     resumed = kb.get_task(conn, task_id)
     assert resumed is not None
@@ -789,5 +795,6 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
             "UPDATE tasks SET consecutive_failures = 1 WHERE id = ?",
             (ok_id,),
         )
+    assert kb.request_review(conn, ok_id)
     assert kb.complete_task(conn, ok_id, summary="done")
     assert _failures(conn, ok_id) == 0

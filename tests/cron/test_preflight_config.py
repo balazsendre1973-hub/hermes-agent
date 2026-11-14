@@ -27,6 +27,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import cron.jobs as cron_jobs
 from cron.scheduler import run_job
 import cron.scheduler as sched
+from cron.scheduler_preflight import _preflight_check_delivery
+from gateway.platform_registry import platform_registry
 
 pytestmark = pytest.mark.usefixtures("cron_owner")
 
@@ -367,3 +369,49 @@ class TestDeliveryPlatform:
 
         assert success is True
         assert agent_constructed is True
+
+    def test_operator_chat_delivery_not_blocked_when_plugin_discovery_suppressed(
+        self, tmp_path, monkeypatch
+    ):
+        """``deliver: operator-chat`` + ``no_agent: false`` passes cron preflight even in a
+        detached / safe-mode worker where ``discover_plugins()`` is suppressed.
+
+        Root cause (t_a2b7f7c8): safe_mode makes ``discover_plugins()`` a no-op, so
+        ``platform_registry`` stays empty, ``_is_known_delivery_platform("operator-chat")``
+        returned ``False`` and the job was blocked with ``blocked_config``. The fix
+        drives the discovery sweep directly in ``_plugin_cron_env_var`` when
+        ``safe_worker_enabled()`` is True, so the standalone ``operator-chat`` platform
+        (renamed from ``log``, commit 322391ba96) is recognized and its
+        ``cron_deliver_env_var`` (``LOG_HOME_CHANNEL``) becomes visible.
+        """
+        # Simulate the detached cron worker: safe_worker_enabled() is True, so the
+        # normal discover_plugins() path is a no-op and the registry would otherwise
+        # stay empty.
+        monkeypatch.setattr(
+            "agent.safe_worker_policy.safe_worker_enabled", lambda: True
+        )
+        # Fresh registry, as in a fresh detached process.
+        platform_registry.unregister("operator-chat")
+
+        from cron.scheduler_delivery import (
+            _is_known_delivery_platform,
+            _plugin_cron_env_var,
+        )
+        from cron.scheduler_preflight import _platform_standalone_only
+
+        # The fix: discovery is driven directly even under safe_mode.
+        assert _plugin_cron_env_var("operator-chat") == "LOG_HOME_CHANNEL"
+        assert _is_known_delivery_platform("operator-chat") is True
+        assert _platform_standalone_only("operator-chat") is True
+
+        # The preflight lets deliver=operator-chat + no_agent=false through (no block).
+        reason = _preflight_check_delivery(
+            {"id": "d522259f0feb", "deliver": "operator-chat", "no_agent": False}
+        )
+        assert reason is None, f"operator-chat delivery must not be blocked: {reason}"
+
+        # Regression guard: an unknown platform is still fail-closed.
+        reason = _preflight_check_delivery(
+            {"id": "x", "deliver": "notaplatform", "no_agent": False}
+        )
+        assert reason is not None and "notaplatform" in reason

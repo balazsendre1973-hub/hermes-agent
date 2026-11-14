@@ -158,6 +158,7 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
         # New subs start caught up at the task's current MAX(task_events.id)
         # (the `created` event) — issue #29905.
         initial_cursor = int(kbn.list_notify_subs(conn1, tid)[0]["last_event_id"])
+        assert kb.request_review(conn1, tid, summary="notify claim handoff")
         kb.complete_task(conn1, tid, result="ok")
 
         old_cursor, claimed_cursor, events = kbn.claim_unseen_events_for_sub(
@@ -473,6 +474,7 @@ def test_migration_backfills_inflight_run_for_legacy_db(kanban_home):
             assert task.current_run_id == runs[0].id
 
             # Subsequent complete closes the backfilled run cleanly.
+            assert kb.request_review(conn2, tid, summary="migration backfill handoff")
             kb.complete_task(conn2, tid, result="done", summary="ok")
             r = kb.latest_run(conn2, tid)
             assert r.outcome == "completed"
@@ -1063,6 +1065,7 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
         assert kb.get_task(conn, parent_a).status == "running"
 
         # Retry with [] (escape hatch): gate is skipped, completion lands.
+        assert kb.request_review(conn, parent_a, summary="retry without claims")
         ok = kb.complete_task(
             conn, parent_a,
             summary="retry without claims",
@@ -1081,6 +1084,7 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
             )
         assert kb.get_task(conn, parent_b).status == "running"
 
+        assert kb.request_review(conn, parent_b, summary="retry with corrected list")
         ok = kb.complete_task(
             conn, parent_b,
             summary="retry with corrected list",
@@ -1306,6 +1310,7 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
     try:
         tid = kb.create_task(conn, title="old task", assignee="w")
         # Historical terminal activity BEFORE anyone subscribes.
+        assert kb.request_review(conn, tid, summary="done long ago")
         kb.complete_task(conn, tid, result="done long ago")
 
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="123")

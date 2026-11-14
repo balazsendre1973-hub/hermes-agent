@@ -3,15 +3,12 @@ import asyncio
 import contextlib
 from contextlib import closing
 from dataclasses import asdict, replace
-import logging
 import threading
 import json
 from pathlib import Path
 import sqlite3
 
 from hermes_state_runtime import RuntimeStoreError
-
-logger = logging.getLogger(__name__)
 
 
 def build_kanban_policy(connection, params, config):
@@ -38,8 +35,7 @@ def build_kanban_policy(connection, params, config):
                     or task.current_run_id != params['run_id'] or run['task_id'] != task.id
                     or task.claim_lock != params['claim_lock'] or run['claim_lock'] != task.claim_lock):
                 raise RuntimeStoreError('stale_kanban_claim')
-            assignee_home = str(resolve_profile_env(task.assignee)) if task.assignee else None
-            if assignee_home is None or Path(assignee_home).resolve() != Path(authority.profile_id).resolve():
+            if Path(resolve_profile_env(task.assignee)).resolve() != Path(authority.profile_id).resolve():
                 raise RuntimeStoreError('profile_mismatch')
             bound = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='owner_admitted' ORDER BY id DESC LIMIT 1",
                                  (task.id, task.current_run_id)).fetchone()
@@ -53,27 +49,8 @@ def build_kanban_policy(connection, params, config):
     except (ValueError, OSError, sqlite3.Error) as exc:
         raise RuntimeStoreError('invalid_kanban_claim') from exc
     cwd = task.workspace_path
-    # Layer (c) read-only pin: a card's model pin may only MIRROR the assignee
-    # profile's pin — a divergent pin (written before the gate existed, or a
-    # card reassigned after pinning) is dropped here so the session runs on the
-    # profile pin instead of a second, independent tier (model_pin_drift).
-    card_model, card_provider = task.model_override, task.provider_override
-    if card_model:
-        try:
-            from hermes_cli import model_pin_drift
-            drift = model_pin_drift.card_override_drift(
-                card_model, card_provider, profile_home=assignee_home,
-            )
-        except Exception:
-            drift = None
-        if drift:
-            logger.warning(
-                "kanban session %s: dropping divergent card model pin: %s",
-                task.id, drift,
-            )
-            card_model, card_provider = None, None
     params_policy = {'source': 'cli', 'cwd': cwd}
-    for name, value in (('model', card_model), ('provider', card_provider), ('reasoning', task.reasoning_effort)):
+    for name, value in (('model', task.model_override), ('provider', task.provider_override), ('reasoning', task.reasoning_effort)):
         if value:
             params_policy[name] = value
     private = {}
@@ -405,10 +382,10 @@ KANBAN_TURN_AUTHOR = {'id': 'kanban:dispatcher', 'name': 'Kanban dispatcher', 'i
 
 
 def _run_task_turns(agent, frame, history, context):
-    from agent.skill_commands import build_preloaded_skills_prompt
+    from agent.skill_commands import build_preloaded_skills_prompt, format_missing_skills
     skills, loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
     if missing and not loaded:
-        raise ValueError('kanban_skills_unavailable')
+        raise ValueError('kanban_skills_unavailable: ' + format_missing_skills(missing))
     prompt = '\n\n'.join(p for p in (skills, context['context'], frame['text']) if p)
     result = agent.run_conversation(prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR)
 

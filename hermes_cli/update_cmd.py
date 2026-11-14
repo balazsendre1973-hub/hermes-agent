@@ -169,10 +169,41 @@ def _m():
 
 
 def _updates_config() -> dict:
-    """The ``updates:`` config section (``{}`` when absent/malformed); may raise on config errors."""
-    from hermes_cli.config import load_config
+    """The ``updates:`` config section (``{}`` when absent/malformed); may raise on config errors.
+
+    A PROFILE-scoped update also consults the ROOT home's config: the shared
+    checkout serves every profile, so the branch policy that decides what the
+    update does to the served tree is a ROOT-level decision. Without this a
+    profile-scoped update read only its own ``config.yaml`` and fell back to the
+    default ``parked_branch_strategy: switch`` — the strategy that moved the
+    served tree off the local dev branch and dropped the local fix commits
+    (t_6d485906). The profile's own value still wins when it sets the key.
+
+    The EXPLICITLY SET value is what decides (the RAW file, not
+    ``load_config()``): ``load_config()`` merges ``DEFAULT_CONFIG``, which
+    always carries ``parked_branch_strategy: "switch"`` — reading the merged
+    value would make the root fallback unreachable.
+    """
+    from hermes_cli.config import load_config, read_raw_config
     section = (load_config() or {}).get("updates", {})
-    return section if isinstance(section, dict) else {}
+    if not isinstance(section, dict):
+        section = {}
+    raw_section = (read_raw_config() or {}).get("updates", {})
+    if not isinstance(raw_section, dict):
+        raw_section = {}
+    if "parked_branch_strategy" in raw_section:
+        section = dict(section)
+        section["parked_branch_strategy"] = raw_section["parked_branch_strategy"]
+        return section
+    with _best_effort('Could not read the root home updates.parked_branch_strategy: %s'):
+        from hermes_constants import get_default_hermes_root
+        from hermes_cli.config import read_config_doc
+        root_doc = read_config_doc(get_default_hermes_root() / "config.yaml") or {}
+        root_section = root_doc.get("updates", {})
+        if isinstance(root_section, dict) and "parked_branch_strategy" in root_section:
+            section = dict(section)
+            section["parked_branch_strategy"] = root_section["parked_branch_strategy"]
+    return section
 
 
 def _map_ssl_cert_file_for_git(git_cmd) -> None:
@@ -200,9 +231,10 @@ def _map_ssl_cert_file_for_git(git_cmd) -> None:
     os.environ["GIT_SSL_CAINFO"] = bundle
 
 
-# Compiled before (preflight) and after (post-pull guard, ZIP gate) every tree move. The first rows
-# are what the launcher and ``hermes_bootstrap`` import before any application code (review G3);
-# test_update_post_pull_syntax_guard derives that set from the real entry paths and pins it here.
+# Startup files of a tree that does not declare its own (pyproject ``[tool.hermes]
+# update-startup-files``, read by ``update_cmd_commit.startup_files``): every release before the
+# declaration has this layout, so the list stays as it is when files move. The first rows are what
+# the launcher and ``hermes_bootstrap`` import before any application code (review G3).
 _UPDATE_CRITICAL_FILES = (
     "hermes_bootstrap.py", "hermes_cli/_parser.py", "hermes_cli/_launchers.py",
     "hermes_cli/_early_recovery.py", "hermes_cli/update_lock.py", "hermes_cli/update_custody.py",
@@ -346,28 +378,6 @@ def _validate_python_files_syntax(
             except OSError as exc:
                 return False, str(path), f"could not read: {exc}"
     return True, None, None
-
-
-def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
-    """Compile each file in ``_UPDATE_CRITICAL_FILES`` to catch SyntaxErrors.
-
-    These are the files imported on every ``hermes`` startup; if any of them
-    has a syntax error (orphan merge-conflict markers, bad ref to a name
-    that no longer exists, etc.) the CLI can't bootstrap at all. We validate
-    them after a successful ``git pull`` so we can auto-roll-back instead of
-    leaving the user with a bricked install.
-
-    The compiled ``.pyc`` is written to a temp directory rather than the
-    source tree's ``__pycache__/`` so we don't race with concurrent test
-    workers that walk the same dir, and so we don't leave a stale pyc
-    behind in production if the next interpreter run picks a different
-    Python version. The pyc is discarded on function return either way —
-    we only care about the compile-or-not signal.
-
-    Returns ``(ok, failing_path, error_message)``. ``ok=True`` means every
-    file parsed cleanly.
-    """
-    return _validate_python_files_syntax(root, _UPDATE_CRITICAL_FILES)
 
 
 # Modules imported on every agent startup. Unlike _UPDATE_CRITICAL_FILES (which
@@ -556,7 +566,7 @@ def _log_only_write(text: str) -> None:
 
     During ``hermes update`` ``sys.stdout`` is an ``_UpdateOutputStream`` that
     mirrors to both the terminal and ``update.log``. Loud, low-signal
-    subprocess output (npm installs, the Electron/vite build, the cua-driver
+    subprocess output (pnpm installs, the Electron/vite build, the cua-driver
     installer's "Next steps" wall) should be captured and tucked into the log
     so failures stay debuggable, without flooding the user's terminal. This
     reaches past the mirroring stream straight to the underlying log handle.
@@ -710,19 +720,6 @@ def _is_shallow_checkout(git_cmd) -> bool:
 def _tip_shas(git_cmd, target_ref: str, base: str = "HEAD") -> tuple[str, str]:
     """``(<base> sha, <target_ref> sha)`` as printed by rev-parse ("" when unresolvable)."""
     return tuple(_git_run(git_cmd, ["rev-parse", ref]).stdout.strip() for ref in (base, target_ref))
-
-
-def _print_update_check_result(behind: int | None, compare_branch: str) -> None:
-    """Report ``--check``'s verdict: up to date, N commits behind, or behind by an unknown count."""
-    if behind == 0:
-        print("✓ Already up to date.")
-        return
-    if behind is not None:
-        print(f"☤ Update available: {behind} {'commit' if behind == 1 else 'commits'} behind {compare_branch}.")
-    else:
-        print(f"☤ Update available (behind {compare_branch}).")
-    from hermes_cli.config import recommended_update_command
-    print(f"  Run '{recommended_update_command()}' to install.")
 
 
 def _source_completion_request(opts, plan, snapshot_id, windows_resume, desktop, gateway_mode) -> dict:
@@ -923,17 +920,12 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha, *, target_r
 
 
 def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=None, _windows_gateway_resume=None) -> None:
-    """Post-pull syntax guard: roll back to *pre_pull_sha* and ``sys.exit(1)`` when a critical
-    file no longer compiles (a bad admin-merge past CI must not brick the CLI)."""
-    pyproject = Path(_m().PROJECT_ROOT) / "pyproject.toml"
-    if pyproject.is_file() and _commit.requires_other_python(pyproject.read_bytes()):
-        # A newer Python's syntax: judged by an installed interpreter the target admits (N15).
-        broken = _commit.tree_syntax_error(_m().PROJECT_ROOT, _UPDATE_CRITICAL_FILES)
-        syntax_ok, failing_path, syntax_error = (broken is None, *(broken or (None, None)))
-    else:
-        syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(_m().PROJECT_ROOT)
-    if not syntax_ok:
-        _roll_back_broken_update(git_cmd, pre_pull_sha, failing_path, syntax_error, rollback_branch=rollback_branch,
+    """Post-pull syntax guard: roll back to *pre_pull_sha* and ``sys.exit(1)`` when a startup file
+    the pulled tree declares is missing or no longer compiles (a bad admin-merge past CI must not
+    brick the CLI), judged by an interpreter the tree's ``requires-python`` admits (N15)."""
+    broken = _commit.tree_syntax_error(_m().PROJECT_ROOT, _UPDATE_CRITICAL_FILES)
+    if broken is not None:
+        _roll_back_broken_update(git_cmd, pre_pull_sha, *broken, rollback_branch=rollback_branch,
                                  _windows_gateway_resume=_windows_gateway_resume)
 
 
@@ -1356,6 +1348,23 @@ def _apply_parked_branch_guard(
         return False, False, None
     switch_safe, switch_block_reason = _m()._assess_parked_branch_switch(
         git_cmd, _m().PROJECT_ROOT, current_branch, branch)
+    in_place_configured = False
+    with _best_effort('Could not read updates.parked_branch_strategy: %s'):
+        in_place_configured = (
+            _updates_config().get("parked_branch_strategy", "switch") == "update_in_place")
+    if not switch_safe and switch_block_reason == "dirty" and in_place_configured:
+        # An IN-PLACE update merges origin/<branch> INTO the parked branch and the checkout
+        # never moves, so the "dirty" refusal (which exists to keep uncommitted work from
+        # riding an autostash across a BRANCH boundary) does not apply here: nothing crosses
+        # a branch boundary. Refusing skipped the whole update over one dirty file
+        # (t_6d485906). The in-place path still stashes the local changes for the merge and
+        # restores them afterwards.
+        ahead = _git_run(git_cmd, ["rev-list", "--count", f"origin/{branch}..HEAD"]).stdout.strip()
+        switch_safe = True
+        switch_block_reason = f"unmerged:{ahead if ahead.isdigit() else 0}"
+        print(
+            "  ℹ The tree has uncommitted changes — the in-place update keeps them "
+            "(no branch switch): they are stashed for the merge and restored after it.")
     if not switch_safe:
         _m()._print_parked_branch_skip_warning(
             git_cmd, _m().PROJECT_ROOT, current_branch, branch, switch_block_reason)
@@ -1367,10 +1376,7 @@ def _apply_parked_branch_guard(
     if not switch_block_reason.startswith("unmerged:"):
         print(f"  ⚠ Checkout was parked on '{current_branch}' (fully merged) — switching back to {branch}...")
         return True, False, switch_block_reason
-    _in_place_configured = False
-    with _best_effort('Could not read updates.parked_branch_strategy: %s'):
-        _in_place_configured = (
-            _updates_config().get("parked_branch_strategy", "switch") == "update_in_place")
+    _in_place_configured = in_place_configured
     if not _in_place_configured or switch_branch:
         _m()._print_parked_branch_kept_notice(
             current_branch, branch, switch_block_reason.split(":", 1)[1])
@@ -1830,10 +1836,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # fail with "File exists" until an operator removed the lock by hand (#132089). Idempotent,
     # and _sweep_stale skips everything while a git process holds it. A killed update's
     # index.lock is younger than the sweep's age floor, so it goes here once its git is proven
-    # dead (we hold the update lock: no other update's git can own it).
-    from hermes_cli.gitlock import release_dead_index_lock
+    # dead (we hold the update lock: no other update's git can own it). Its killed fetch's ref
+    # and shallow locks likewise, or every later fetch fails ("reference already exists").
+    from hermes_cli.gitlock import release_dead_fetch_locks, release_dead_index_lock
     if release_dead_index_lock(_m().PROJECT_ROOT):
         print("  (removed .git/index.lock left by a git that was killed)")
+    for lock in release_dead_fetch_locks(_m().PROJECT_ROOT):
+        print(f"  (removed {lock} left by a git that was killed)")
     _check.clear_git_debris(_m().PROJECT_ROOT)
 
     opts = _resolve_update_options(args, gateway_mode)

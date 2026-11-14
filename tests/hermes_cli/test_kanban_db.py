@@ -690,7 +690,10 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         tid = kb.create_task(conn, title="child", parents=[parent], assignee="worker")
         kb.add_comment(conn, tid, "user", "cleanup me")
         kb.claim_task(conn, tid)
-        kb.complete_task(conn, tid, result="done")
+        # Parent left open on purpose: the parent gate refuses completion and
+        # leaves a runnable card whose archive/delete cleanup is what this test
+        # exercises (status stays 'running', nothing terminal written).
+        assert not kb.complete_task(conn, tid, result="done")
         assert kb.archive_task(conn, tid)
         conn.execute(
             "INSERT INTO kanban_notify_subs(task_id, platform, chat_id, thread_id, user_id, created_at, last_event_id) "
@@ -821,6 +824,7 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
         artifact = ws / "chart.png"
         artifact.write_bytes(b"png-bytes")
 
+        assert kb.request_review(conn, t, summary="render chart")
         assert kb.complete_task(
             conn,
             t,
@@ -931,9 +935,11 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
         parent_ws = kbw.resolve_workspace(p_task)
         kbw.set_workspace_path(conn, parent, parent_ws)
 
+        assert kb.request_review(conn, parent)
         kb.complete_task(conn, parent, result="handoff")
         assert parent_ws.exists(), "deferred while dir child active"
 
+        assert kb.request_review(conn, child)
         kb.complete_task(conn, child, result="built")
 
     assert not parent_ws.exists(), (
@@ -1005,6 +1011,7 @@ def test_symlinked_workspaces_root_does_not_widen_scratch_cleanup(kanban_home, t
         # Legacy explicit-path scratch task pointing straight at user data.
         t = kb.create_task(conn, title="scratch")
         kbw.set_workspace_path(conn, t, victim)
+        assert kb.request_review(conn, t)
         assert kb.complete_task(conn, t, result="done")
     assert (victim / "keep.txt").is_file()
 
@@ -1398,6 +1405,7 @@ def test_link_tasks_no_dependency_wait_when_parent_done(kanban_home):
     """A done parent demotes nothing and reports no gate."""
     with kbc.connect() as conn:
         parent = kb.create_task(conn, title="done parent")
+        assert kb.request_review(conn, parent)
         kb.complete_task(conn, parent, result="done")
         child = kb.create_task(conn, title="follower")
 
@@ -1454,6 +1462,7 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
     with kbc.connect() as conn:
         # A is done.
         a = kb.create_task(conn, title="parent-done")
+        assert kb.request_review(conn, a)
         kb.complete_task(conn, a, result="done")
 
         # C is running (not done) — blocks child B.

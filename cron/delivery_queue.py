@@ -12,10 +12,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
@@ -34,6 +36,39 @@ _ACTIVE_DELIVERIES: set[str] = set()
 _TERMINAL = ("delivered", "failed", "unknown", "suppressed")
 MAX_TERMINAL_DELIVERIES = 1000
 DEFAULT_DELIVERY_WAIT_TIMEOUT_SECONDS = 300.0
+# Transient send errors are re-queued with backoff instead of terminalized ``failed``:
+# Telegram 429 (honors retry-after) and DNS/timeout/connection errors. Everything else
+# (incl. \"unknown platform X\") fails closed immediately - a misconfigured platform must
+# not be retried forever.
+MAX_DELIVERY_RETRY_ATTEMPTS = 5
+RETRY_BASE_SECONDS = 5.0
+RETRY_CAP_SECONDS = 300.0
+_TRANSIENT_RE = re.compile(r"retry\s+after\s+(\d+)", re.IGNORECASE)
+_DNS_SIGNALS = (
+    "temporary failure in name resolution",
+    "nodename nor servname provided",
+    "[errno -3]",
+    "timed out",
+    "connection refused",
+    "network is unreachable",
+    "no route to host",
+)
+
+
+def _transient_backoff(error: Optional[str], attempt: int) -> Optional[float]:
+    """Seconds until the next retry attempt for a transient send error; None = permanent.
+
+    *attempt* is 1-based: the attempt number that comes next after this failure.
+    """
+    if not error:
+        return None
+    low = error.lower()
+    if "http 429" in low or "too many requests" in low:
+        m = _TRANSIENT_RE.search(low)
+        return float(m.group(1)) if m else RETRY_BASE_SECONDS
+    if any(signal in low for signal in _DNS_SIGNALS):
+        return min(RETRY_CAP_SECONDS, RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
+    return None
 
 
 def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
@@ -134,6 +169,13 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         conn, "deliveries", "for_failure",
         "for_failure INTEGER NOT NULL DEFAULT 0",
     )
+    add_column_if_missing(
+        conn, "deliveries", "retry_attempts",
+        "retry_attempts INTEGER NOT NULL DEFAULT 0",
+    )
+    add_column_if_missing(
+        conn, "deliveries", "next_retry_at", "next_retry_at TEXT",
+    )
 
 
 def _connect() -> sqlite3.Connection:
@@ -231,9 +273,13 @@ def claim_next() -> Optional[dict]:
     started = _process_start_time(pid)
     with _transaction() as conn:
         # created_at carries a DST-varying offset: order by instant, not text.
+        # next_retry_at is a transient failure's backoff deadline: claim due rows only, so a
+        # waiting retry neither hot-loops inside one drain nor starves newer rows (per-row filter).
         row = conn.execute(
             "SELECT execution_id FROM deliveries WHERE status='pending' "
-            "ORDER BY julianday(created_at), created_at, execution_id LIMIT 1"
+            "AND (next_retry_at IS NULL OR julianday(next_retry_at) <= julianday(?)) "
+            "ORDER BY julianday(created_at), created_at, execution_id LIMIT 1",
+            (_hermes_now().isoformat(),),
         ).fetchone()
         if row is None:
             return None
@@ -255,6 +301,12 @@ def claim_next() -> Optional[dict]:
 
 
 def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False) -> bool:
+    """Terminalize a claimed send — or re-queue it with backoff when the error is transient.
+
+    Returns True only for a terminal disposition (the drain settles the job's outcome bookkeeping
+    on True). A transient failure (429 retry_after / DNS-etc, ``_transient_backoff``) re-queues the
+    row as ``pending`` with payload intact and ``next_retry_at`` set: returns False, no settle, no
+    terminal prune — the next due claim sends it again until ``MAX_DELIVERY_RETRY_ATTEMPTS``."""
     status = "failed" if error else "suppressed" if suppressed else "delivered"
     safe_error = (
         redact_sensitive_text(str(error), force=True, redact_url_credentials=True)
@@ -262,6 +314,35 @@ def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False
         else None
     )
     with _transaction() as conn:
+        if error:
+            # Classify on the RAW error: redaction must not be able to hide a retry signal.
+            attempt = conn.execute(
+                "SELECT retry_attempts FROM deliveries WHERE execution_id=? "
+                "AND status='delivering' AND owner_process_id=? AND owner_pid=?",
+                (str(execution_id), _PROCESS_ID, os.getpid()),
+            ).fetchone()
+            attempt_no = int(attempt["retry_attempts"]) + 1 if attempt is not None else 0
+            backoff = _transient_backoff(str(error), attempt_no) if attempt_no else None
+            if backoff is not None and attempt_no > MAX_DELIVERY_RETRY_ATTEMPTS:
+                backoff = None  # retry budget exhausted: this failure terminalizes
+            if backoff is not None:
+                retry_at = (_hermes_now() + timedelta(seconds=backoff)).isoformat()
+                requeued = conn.execute(
+                    """UPDATE deliveries SET status='pending', error=?, retry_attempts=retry_attempts+1,
+                       next_retry_at=?, finished_at=NULL, owner_process_id=NULL, owner_pid=NULL,
+                       owner_started_at=NULL
+                       WHERE execution_id=? AND status='delivering'
+                         AND owner_process_id=? AND owner_pid=?""",
+                    (safe_error, retry_at, str(execution_id), _PROCESS_ID, os.getpid()),
+                )
+                if requeued.rowcount == 1:
+                    logger.warning(
+                        "Cron delivery %s: transient send error, retry %d/%d in %.0fs: %s",
+                        execution_id, attempt_no,
+                        MAX_DELIVERY_RETRY_ATTEMPTS, backoff, safe_error,
+                    )
+                # Not terminal either way: we lost the row or we deferred it — settle nothing.
+                return False
         cur = conn.execute(
             """UPDATE deliveries SET status=?, finished_at=?, error=?
                WHERE execution_id=? AND status='delivering'
@@ -270,7 +351,7 @@ def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False
                 status,
                 _hermes_now().isoformat(),
                 safe_error,
-                execution_id,
+                str(execution_id),
                 _PROCESS_ID,
                 os.getpid(),
             ),
@@ -328,7 +409,8 @@ def recover_abandoned() -> int:
 def drain(
     send: Callable[[dict, str, bool], Optional[str]], *, limit: int = 20
 ) -> int:
-    """Deliver pending rows through *send*, terminalizing every claimed row."""
+    """Deliver pending rows through *send*, settling each terminal row; transient failures are
+    re-queued with backoff by ``_finish`` instead of terminalized."""
     recover_abandoned()
     processed = 0
     for _ in range(max(0, limit)):

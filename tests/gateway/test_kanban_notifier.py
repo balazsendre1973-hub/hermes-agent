@@ -125,6 +125,11 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
         "telegram_dm_topic_reply_fallback": True,
         "telegram_reply_to_message_id": "462",
         "thread_id": "20197",
+        # The ping must reach the chat LOUDLY: the Telegram adapter's default
+        # notifications mode ("important") silences any send without notify=True, and
+        # the only loud message would otherwise be the wake turn's agent reply --
+        # FIFO-queued behind the busy session (measured: 3-45 min late).
+        "notify": True,
     }
     assert len(adapter.handled) == 1
     assert adapter.handled[0].source.chat_type == "dm"
@@ -796,3 +801,80 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_kanban_ping_is_notified_loudly(tmp_path, monkeypatch):
+    """The ping must reach the chat LOUDLY, not as a silent bubble.
+
+    Regression (NOTIFIER-LATENCY, t_549bcc0c): the Telegram adapter's default
+    notifications mode is "important", which sends every message WITHOUT
+    ``notify=True`` with ``disable_notification=True`` -- a silent bubble. The
+    kanban ping carried no such marker, so the ONLY loud message for a finished
+    task was the wake turn's agent reply, which is FIFO-queued behind the busy
+    main-chat session. Measured 2026-11-13: the wake's queue wait alone was
+    median 204 s / max 1960 s (today's notifier-fire -> visible median 903 s),
+    and the ping itself was already on the wire within seconds of the event.
+
+    The ping IS the notification the subscriber asked for; it must not depend on
+    the wake's turn latency.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "ping-notify.db"))
+    kb.init_db()
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="loud ping", assignee="worker")
+        kbn.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            delivery_mode="notify+wake",
+        )
+        kb.complete_task(conn, tid, summary="done", force=True)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["metadata"].get("notify") is True, (
+        "the kanban ping must be marked notify-worthy so the Telegram adapter "
+        "does not silence it (disable_notification=True)"
+    )
+
+
+def test_kanban_ping_notify_marker_does_not_override_subscribed_metadata(tmp_path, monkeypatch):
+    """The notify marker is ADDED; it must not drop the subscriber's own routing keys."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "ping-notify-meta.db"))
+    kb.init_db()
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="routed ping", assignee="worker")
+        kbn.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="20197",
+            chat_type="dm",
+            delivery_mode="notify+wake",
+            delivery_metadata={"chat_type": "dm", "telegram_reply_to_message_id": "462"},
+        )
+        kb.complete_task(conn, tid, summary="done", force=True)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    meta = adapter.sent[0]["metadata"]
+    assert meta.get("notify") is True
+    assert meta.get("chat_type") == "dm"
+    assert meta.get("telegram_reply_to_message_id") == "462"
+    assert meta.get("thread_id") == "20197"

@@ -1852,6 +1852,94 @@ class TestJobsJsonIdKeyedMap:
             assert "***" not in caplog.text
 
 
+# =========================================================================
+# Store wiped by a direct write (the measured 2026-11-08 12:46 incident)
+# =========================================================================
+
+class TestJobsJsonStoreWipe:
+    """A payload written over the whole store (no ``jobs`` key) must never load as a silent
+    empty list — that silence is how 28 jobs disappeared for 4.5 hours while `hermes cron
+    doctor` printed "✓ no issues / No active jobs configured" (t_4b5c04c4 → t_8a374f07).
+
+    The fix (S-b, t_4d9cf69b): name it on every load with a WARNING and leave a durable
+    ``cron_incidents`` row, without rewriting the alien bytes (they are restore evidence).
+    """
+
+    def test_missing_jobs_key_warns_and_incidents(self, tmp_cron_dir, caplog):
+        import json
+
+        import cron.jobs as jobs_mod
+        from cron.jobs import JOBS_FILE, load_jobs
+
+        create_job(prompt="keep me", schedule="every 1h", name="survivor")
+        # The measured corrupt shape: a single-field payload, no 'jobs', no 'updated_at'.
+        alien = {"prompt": "Daily error & prevention analyst ..."}
+        JOBS_FILE.write_text(json.dumps(alien), encoding="utf-8")
+
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="cron.jobs"):
+            assert load_jobs() == []
+        text = caplog.text
+        assert "cron store damaged" in text, text
+        assert "'jobs' key missing" in text, text
+        assert str(JOBS_FILE) in text, text
+
+        # No quiet rewrite: the alien payload stays on disk as restore evidence.
+        assert json.loads(JOBS_FILE.read_text(encoding="utf-8")) == alien
+
+        # Durable incident (deduped by signature, throttled to one write per interval).
+        from cron import incidents
+        rows = [i for i in incidents.list_incidents() if i["job_id"] == jobs_mod.STORE_DAMAGE_INCIDENT_JOB_ID]
+        assert len(rows) == 1, rows
+        assert rows[0]["state"] == "detected"
+        assert rows[0]["failure_type"] == "config"
+        assert "'jobs' key missing" in rows[0]["error"]
+        assert str(JOBS_FILE) in rows[0]["error"]
+
+    def test_second_load_within_interval_writes_no_second_row(self, tmp_cron_dir, caplog):
+        import json
+
+        from cron import incidents
+        from cron.jobs import JOBS_FILE, load_jobs
+
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_text(json.dumps({"prompt": "x"}), encoding="utf-8")
+        with caplog.at_level("WARNING", logger="cron.jobs"):
+            assert load_jobs() == []
+            caplog.clear()
+            assert load_jobs() == []
+        assert caplog.text.count("cron store damaged") >= 1, caplog.text  # loud EVERY load
+        rows = [i for i in incidents.list_incidents() if i["job_id"] == "cron-store"]
+        assert len(rows) == 1, rows  # ...but only one durable row
+
+    def test_invalid_jobs_field_type_also_incidents(self, tmp_cron_dir, caplog):
+        import json
+
+        from cron import incidents
+        from cron.jobs import JOBS_FILE, load_jobs
+
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_text(json.dumps({"jobs": "not-a-list"}), encoding="utf-8")
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="cron.jobs"):
+            assert load_jobs() == []
+        assert "cron store damaged" in caplog.text, caplog.text
+        rows = [i for i in incidents.list_incidents() if i["job_id"] == "cron-store"]
+        assert len(rows) == 1, rows
+
+    def test_healthy_and_empty_stores_stay_silent(self, tmp_cron_dir, caplog):
+        """No false alarm for a valid store, nor for a legitimately empty one (jared baseline:
+        0 jobs) — otherwise every tick would cry wolf."""
+        from cron.jobs import load_jobs, save_jobs
+
+        assert load_jobs() == []  # the store does not exist yet: [] without any warning
+        save_jobs([])             # canonical empty store: valid shape, still silent
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="cron.jobs"):
+            assert load_jobs() == []
+        assert "cron store damaged" not in caplog.text, caplog.text
+
+
 
 
 
